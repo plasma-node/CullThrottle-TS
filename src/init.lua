@@ -411,8 +411,10 @@ function CullThrottle.getObjectsToUpdate(self: CullThrottle): () -> (Instance?, 
 			:Max(farPlaneBottomRight) // voxelSize
 
 		local function isVoxelKeyInView(voxelKey: Vector3): boolean
+			debug.profilebegin("isVoxelKeyInView")
 			-- Check if we already know the answer
 			if self._visibleVoxels[voxelKey] then
+				debug.profileend()
 				return true
 			end
 
@@ -428,6 +430,7 @@ function CullThrottle.getObjectsToUpdate(self: CullThrottle): () -> (Instance?, 
 				or relativeToOBB.Z > distance2
 				or relativeToOBB.Z < -distance2
 			then
+				debug.profileend()
 				return false
 			end
 
@@ -439,14 +442,17 @@ function CullThrottle.getObjectsToUpdate(self: CullThrottle): () -> (Instance?, 
 				or rightNormal:Dot(lookToCell) < 0
 				or bottomNormal:Dot(lookToCell) > 0
 			then
+				debug.profileend()
 				return false
 			end
 
+			debug.profileend()
 			return true
 		end
 
 		debug.profilebegin("FindVisibleVoxels")
 
+		debug.profilebegin("setCameraVoxelVisible")
 		local cameraVoxelKey = cameraPos // voxelSize
 		local farPlaneVoxelKey = farPlaneCFrame.Position // voxelSize
 		local topLeftVoxelKey = farPlaneTopLeft // voxelSize
@@ -456,7 +462,9 @@ function CullThrottle.getObjectsToUpdate(self: CullThrottle): () -> (Instance?, 
 
 		-- The camera should always be inside
 		self:_setVoxelKeyVisible(cameraVoxelKey)
+		debug.profileend()
 
+		debug.profilebegin("setFrustumLinesVisible")
 		-- We know the voxels in straight in front of us will all be visible, so
 		-- we can skip expensive visiblity checks on them
 		self:_setVoxelsInLineToVisible(cameraVoxelKey, farPlaneVoxelKey)
@@ -469,9 +477,11 @@ function CullThrottle.getObjectsToUpdate(self: CullThrottle): () -> (Instance?, 
 		self:_setVoxelsInLineToVisible(topRightVoxelKey, bottomLeftVoxelKey)
 		self:_setVoxelsInLineToVisible(topLeftVoxelKey, bottomLeftVoxelKey)
 		self:_setVoxelsInLineToVisible(topRightVoxelKey, bottomRightVoxelKey)
+		debug.profileend()
 
 		-- Now we have to actually search and fill in the frustum
 
+		debug.profilebegin("binarySearch")
 		for x = minBound.X, maxBound.X do
 			for y = minBound.Y, maxBound.Y do
 				for searchZ = minBound.Z, maxBound.Z do
@@ -502,14 +512,18 @@ function CullThrottle.getObjectsToUpdate(self: CullThrottle): () -> (Instance?, 
 					end
 
 					-- Add all the voxels from the entry to the exit
+					debug.profilebegin("setVoxelKeyVisible")
 					for z = entry, exit do
 						self:_setVoxelKeyVisible(Vector3.new(x, y, z))
 					end
+					debug.profileend()
 
 					break
 				end
 			end
 		end
+		debug.profileend()
+
 		debug.profileend()
 
 		debug.profilebegin("UpdateObjects")
