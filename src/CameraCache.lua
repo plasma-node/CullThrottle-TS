@@ -5,8 +5,6 @@
     every frame, especially the ones that don't update often.
 --]]
 
-local FOV_PADDING = 5
-
 export type CameraCache = {
 	Object: Camera,
 	CFrame: CFrame,
@@ -21,8 +19,8 @@ local CameraCache: CameraCache = {
 	Object = workspace.CurrentCamera,
 	CFrame = workspace.CurrentCamera.CFrame,
 	Position = workspace.CurrentCamera.CFrame.Position,
-	FieldOfView = workspace.CurrentCamera.FieldOfView + FOV_PADDING,
-	HalfTanFOV = math.tan(math.rad((workspace.CurrentCamera.FieldOfView + FOV_PADDING) / 2)),
+	FieldOfView = workspace.CurrentCamera.FieldOfView,
+	HalfTanFOV = math.tan(math.rad(workspace.CurrentCamera.FieldOfView / 2)),
 	ViewportSize = workspace.CurrentCamera.ViewportSize,
 	AspectRatio = workspace.CurrentCamera.ViewportSize.X / workspace.CurrentCamera.ViewportSize.Y,
 }
@@ -38,7 +36,7 @@ local function initCamera(camera: Camera)
 	CameraCache.Object = camera
 	CameraCache.CFrame = CameraCache.Object.CFrame
 	CameraCache.ViewportSize = CameraCache.Object.ViewportSize
-	CameraCache.FieldOfView = CameraCache.Object.FieldOfView + FOV_PADDING
+	CameraCache.FieldOfView = CameraCache.Object.FieldOfView
 	CameraCache.Position = CameraCache.CFrame.Position
 	CameraCache.AspectRatio = CameraCache.ViewportSize.X / CameraCache.ViewportSize.Y
 	CameraCache.HalfTanFOV = math.tan(math.rad(CameraCache.FieldOfView / 2))
@@ -48,7 +46,7 @@ local function initCamera(camera: Camera)
 		CameraCache.Position = CameraCache.CFrame.Position
 	end)
 	cameraConnections.FieldOfViewChanged = CameraCache.Object:GetPropertyChangedSignal("FieldOfView"):Connect(function()
-		CameraCache.FieldOfView = CameraCache.Object.FieldOfView + FOV_PADDING
+		CameraCache.FieldOfView = CameraCache.Object.FieldOfView
 		CameraCache.HalfTanFOV = math.tan(math.rad(CameraCache.FieldOfView / 2))
 	end)
 	cameraConnections.ViewportSizeChanged = CameraCache.Object
