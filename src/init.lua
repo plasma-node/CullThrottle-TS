@@ -379,6 +379,7 @@ function CullThrottle.getObjectsToUpdate(self: CullThrottle): () -> (Instance?, 
 		local renderDistanceSq = renderDistance * renderDistance
 		local nearRefreshRate = self._nearRefreshRate
 		local refreshRateRange = self._refreshRateRange
+		local halfVoxelSizeVector = Vector3.one * (voxelSize / 2)
 		local cameraCFrame = CameraCache.CFrame
 		local cameraPos = CameraCache.Position
 		local rightVec, upVec = cameraCFrame.RightVector, cameraCFrame.UpVector
@@ -518,27 +519,28 @@ function CullThrottle.getObjectsToUpdate(self: CullThrottle): () -> (Instance?, 
 				continue
 			end
 
+			-- Instead of throttling updates for each object by distance, we approximate by computing the distance
+			-- to the voxel center. This gives us less precise throttling, but saves a ton of compute
+			-- and scales on voxel size instead of object count.
+			debug.profilebegin("DistanceThrottling")
+			local voxelWorldPos = (voxelKey * voxelSize) + halfVoxelSizeVector
+			local dx = cameraPos.X - voxelWorldPos.X
+			local dy = cameraPos.Y - voxelWorldPos.Y
+			local dz = cameraPos.Z - voxelWorldPos.Z
+			local distSq = dx * dx + dy * dy + dz * dz
+			local refreshDelay = nearRefreshRate + (refreshRateRange * math.min(distSq / renderDistanceSq, 1))
+			debug.profileend()
+
 			for _, object in voxel do
 				local objectData = self._objects[object]
 				if not objectData then
 					continue
 				end
 
-				-- Throttle object updates based on distance,
-				-- so distant objects update less frequently
-				debug.profilebegin("DistanceThrottling")
-				local objectPos = objectData.position
-				local dx = cameraPos.X - objectPos.X
-				local dy = cameraPos.Y - objectPos.Y
-				local dz = cameraPos.Z - objectPos.Z
-				local distSq = dx * dx + dy * dy + dz * dz
-				local refreshDelay = nearRefreshRate + (refreshRateRange * (distSq / renderDistanceSq))
-
+				-- We add jitter to the timings so we don't end up with
+				-- every object in the voxel updating on the same frame
 				local elapsed = now - objectData.lastUpdateClock
-				-- Add a bit of jitter to the timings so we don't get spikes
-				-- of objects all updating on the same frame
-				local jitter = math.random() / 200
-				debug.profileend()
+				local jitter = math.random() / 150
 				if elapsed + jitter <= refreshDelay then
 					-- It is not yet time to update this one
 					continue
