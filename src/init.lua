@@ -76,9 +76,9 @@ function CullThrottle._getPositionOfObject(
 		return object.Position, changeConnection
 	elseif object:IsA("Model") then
 		if onChanged then
-			changeConnection = object:GetPropertyChangedSignal("Origin"):Connect(onChanged)
+			changeConnection = object:GetPropertyChangedSignal("WorldPivot"):Connect(onChanged)
 		end
-		return object.Origin.Position, changeConnection
+		return object:GetPivot().Position, changeConnection
 	elseif object:IsA("Bone") then
 		if onChanged then
 			changeConnection = object:GetPropertyChangedSignal("TransformedWorldCFrame"):Connect(onChanged)
