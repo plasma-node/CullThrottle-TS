@@ -7,6 +7,7 @@ if RunService:IsServer() and not RunService:IsEdit() then
 	error("CullThrottle is a client side effect and cannot be used on the server")
 end
 
+local PriorityQueue = require(script.PriorityQueue)
 local CameraCache = require(script.CameraCache)
 
 local CullThrottle = {}
@@ -22,11 +23,16 @@ type CullThrottleProto = {
 	_voxelSize: number,
 	_voxels: { [Vector3]: { Instance } },
 	_visibleVoxels: { [Vector3]: boolean },
-	_objects: { [Instance]: {
-		voxelKey: Vector3,
-		position: Vector3,
-		lastUpdateClock: number,
-	} },
+	_objects: {
+		[Instance]: {
+			lastUpdateClock: number,
+			voxelKey: Vector3,
+			desiredVoxelKey: Vector3?,
+			position: Vector3,
+			positionChangeConnection: RBXScriptConnection?,
+		},
+	},
+	_objectRefreshQueue: PriorityQueue.PriorityQueue,
 }
 
 export type CullThrottle = typeof(setmetatable({} :: CullThrottleProto, CullThrottle))
@@ -35,64 +41,89 @@ function CullThrottle.new(): CullThrottle
 	local self = setmetatable({}, CullThrottle)
 
 	self._voxelSize = 75
-	self._farRefreshRate = 1 / 10
+	self._farRefreshRate = 1 / 15
 	self._nearRefreshRate = 1 / 45
 	self._refreshRateRange = self._farRefreshRate - self._nearRefreshRate
-	self._renderDistance = 500
+	self._renderDistance = 400
 	self._halfRenderDistance = self._renderDistance / 2
 	self._renderDistanceSq = self._renderDistance * self._renderDistance
 	self._voxels = {}
-	self._objects = {}
 	self._visibleVoxels = {}
+	self._objects = {}
+	self._objectRefreshQueue = PriorityQueue.new()
 
 	return self
 end
 
-function CullThrottle._getPositionOfObject(self: CullThrottle, object: Instance): Vector3?
+function CullThrottle._getPositionOfObject(
+	self: CullThrottle,
+	object: Instance,
+	onChanged: (() -> ())?
+): (Vector3?, RBXScriptConnection?)
 	if object == workspace then
 		-- Workspace technically inherits Model,
 		-- but the origin vector isn't useful here
-		return nil
+		return nil, nil
 	end
 
+	local changeConnection = nil
+
 	if object:IsA("BasePart") then
-		return object.Position
-	elseif object:IsA("PVInstance") then
-		return object:GetPivot().Position
+		if onChanged then
+			-- Connect to CFrame, not Position, since BulkMoveTo only fires CFrame changed event
+			changeConnection = object:GetPropertyChangedSignal("CFrame"):Connect(onChanged)
+		end
+		return object.Position, changeConnection
+	elseif object:IsA("Model") then
+		if onChanged then
+			changeConnection = object:GetPropertyChangedSignal("Origin"):Connect(onChanged)
+		end
+		return object.Origin.Position, changeConnection
 	elseif object:IsA("Bone") then
-		return object.TransformedWorldCFrame.Position
+		if onChanged then
+			changeConnection = object:GetPropertyChangedSignal("TransformedWorldCFrame"):Connect(onChanged)
+		end
+		return object.TransformedWorldCFrame.Position, changeConnection
 	elseif object:IsA("Attachment") then
-		return object.WorldPosition
+		if onChanged then
+			changeConnection = object:GetPropertyChangedSignal("WorldPosition"):Connect(onChanged)
+		end
+		return object.WorldPosition, changeConnection
 	elseif object:IsA("Beam") then
 		-- Beams are roughly located between their attachments
 		local attachment0, attachment1 = object.Attachment0, object.Attachment1
 		if not attachment0 or not attachment1 then
 			warn("Cannot determine position of Beam since it does not have attachments")
-			return nil
+			return nil, nil
+		end
+		if onChanged then
+			-- We really should be listening to both attachments, but I don't care to support 2 change connections
+			-- for a single object right now.
+			changeConnection = attachment0:GetPropertyChangedSignal("WorldPosition"):Connect(onChanged)
 		end
 		return (attachment0.WorldPosition + attachment1.WorldPosition) / 2
 	elseif object:IsA("Light") or object:IsA("Sound") or object:IsA("ParticleEmitter") then
 		-- These effect objects are positioned based on their parent
 		if not object.Parent then
 			warn("Cannot determine position of " .. object.ClassName .. " since it is not parented")
-			return nil
+			return nil, nil
 		end
-		return self:_getPositionOfObject(object.Parent)
+		return self:_getPositionOfObject(object.Parent, onChanged)
 	end
 
 	-- We don't know how to get the position of this,
 	-- so let's assume it's at the parent position
 	if not object.Parent then
 		warn("Cannot determine position of " .. object.ClassName .. ", unknown class with no parent")
-		return nil
+		return nil, nil
 	end
 
-	local parentPosition = self:_getPositionOfObject(object.Parent)
+	local parentPosition, parentChangeConnection = self:_getPositionOfObject(object.Parent, onChanged)
 	if not parentPosition then
 		warn("Cannot determine position of " .. object:GetFullName() .. ", ancestry objects lack position info")
 	end
 
-	return parentPosition
+	return parentPosition, parentChangeConnection
 end
 
 function CullThrottle._insertToVoxel(self: CullThrottle, voxelKey: Vector3, object: Instance)
@@ -103,6 +134,35 @@ function CullThrottle._insertToVoxel(self: CullThrottle, voxelKey: Vector3, obje
 	else
 		-- Existing voxel, add this object to its list
 		table.insert(voxel, object)
+	end
+end
+
+function CullThrottle._removeFromVoxel(self: CullThrottle, voxelKey: Vector3, object: Instance)
+	local voxel = self._voxels[voxelKey]
+	if not voxel then
+		return
+	end
+
+	local objectIndex = table.find(voxel, object)
+	if not objectIndex then
+		return
+	end
+
+	local n = #voxel
+	if n == 1 then
+		-- Lets just cleanup this now empty voxel instead
+		self._voxels[voxelKey] = nil
+	elseif n == objectIndex then
+		-- This object is at the end, so we can remove it without needing
+		-- to shift anything or fill gaps
+		voxel[objectIndex] = nil
+	else
+		-- To avoid shifting the whole array, we take the
+		-- last object and move it to overwrite this one
+		-- since order doesn't matter in this list
+		local lastObject = voxel[n]
+		voxel[n] = nil
+		voxel[objectIndex] = lastObject
 	end
 end
 
@@ -227,15 +287,48 @@ function CullThrottle.setRefreshRates(self: CullThrottle, near: number, far: num
 end
 
 function CullThrottle.add(self: CullThrottle, object: Instance)
-	local position = self:_getPositionOfObject(object)
+	local position, positionChangeConnection = self:_getPositionOfObject(object, function()
+		-- We aren't going to move voxels immediately, since having many parts jumping around voxels
+		-- is very costly. Instead, we queue up this object to be refreshed, and prioritize objects
+		-- that are moving around closer to the camera
+
+		local objectData = self._objects[object]
+		if not objectData then
+			return
+		end
+
+		local newPosition = self:_getPositionOfObject(object)
+		if not newPosition then
+			-- Don't know where this should go anymore. Might need to be removed,
+			-- but that's the user's responsibility
+			return
+		end
+
+		objectData.position = newPosition
+
+		local desiredVoxelKey = newPosition // self._voxelSize
+		if desiredVoxelKey == objectData.voxelKey then
+			-- Object moved within the same voxel, no need to refresh
+			return
+		end
+
+		objectData.desiredVoxelKey = desiredVoxelKey
+
+		-- Use a cheap manhattan distance check for priority
+		local difference = newPosition - CameraCache.Position
+		local priority = math.abs(difference.X) + math.abs(difference.Y) + math.abs(difference.Z)
+
+		self._objectRefreshQueue:enqueue(object, priority)
+	end)
 	if not position then
 		error("Cannot add " .. object:GetFullName() .. " to CullThrottle, position is unknown")
 	end
 
 	local objectData = {
+		lastUpdateClock = os.clock(),
 		voxelKey = position // self._voxelSize,
 		position = position,
-		lastUpdateClock = os.clock(),
+		positionChangeConnection = positionChangeConnection,
 	}
 
 	self._objects[object] = objectData
@@ -245,36 +338,35 @@ end
 
 function CullThrottle.remove(self: CullThrottle, object: Instance)
 	local objectData = self._objects[object]
-	if objectData then
-		self._objects[object] = nil
-
-		local voxel = self._voxels[objectData.voxelKey]
-		local objectIndex = table.find(voxel, object)
-		if objectIndex then
-			local n = #voxel
-
-			if n == 1 then
-				-- Lets just cleanup this now empty voxel instead
-				self._voxels[objectData.voxelKey] = nil
-			elseif n == objectIndex then
-				-- This object is at the end, so we can remove it without needing
-				-- to shift anything or fill gaps
-				voxel[objectIndex] = nil
-			else
-				-- To avoid shifting the whole array, we take the
-				-- last object and move it to overwrite this one
-				-- since order doesn't matter in this list
-				local lastObject = voxel[n]
-				voxel[n] = nil
-				voxel[objectIndex] = lastObject
-			end
-		end
+	if not objectData then
+		return
 	end
+	if objectData.positionChangeConnection then
+		objectData.positionChangeConnection:Disconnect()
+	end
+	self._objects[object] = nil
+	self:_removeFromVoxel(objectData.voxelKey, object)
 end
 
 function CullThrottle.getObjectsToUpdate(self: CullThrottle): () -> (Instance?, number?)
 	table.clear(self._visibleVoxels)
 	local now = os.clock()
+
+	-- We'll start by spending up to 0.1 milliseconds processing the queued object refreshes
+	debug.profilebegin("ObjectRefreshQueue")
+	while (not self._objectRefreshQueue:empty()) and (os.clock() - now < 0.0001) do
+		local object = self._objectRefreshQueue:dequeue()
+		local objectData = self._objects[object]
+		if (not objectData) or not objectData.desiredVoxelKey then
+			continue
+		end
+
+		self:_insertToVoxel(objectData.desiredVoxelKey, object)
+		self:_removeFromVoxel(objectData.voxelKey, object)
+		objectData.voxelKey = objectData.desiredVoxelKey
+		objectData.desiredVoxelKey = nil
+	end
+	debug.profileend()
 
 	local thread = coroutine.create(function()
 		local voxelSize = self._voxelSize
