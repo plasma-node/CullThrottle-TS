@@ -1,0 +1,30 @@
+{
+  "name": "CullThrottleDemo",
+  "tree": {
+    "$className": "DataModel",
+
+    "ReplicatedStorage": {
+      "$className": "ReplicatedStorage",
+
+      "Packages": {
+        "$className": "Folder",
+
+        "CullThrottle": {
+          "$path": "src"
+        }
+      }
+    },
+
+    "StarterPlayer": {
+      "$className": "StarterPlayer",
+
+      "StarterPlayerScripts": {
+        "$className": "StarterPlayerScripts",
+
+        "CullThrottleDemo": {
+          "$path": "demo"
+        }
+      }
+    }
+  }
+}
