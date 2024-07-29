@@ -251,7 +251,7 @@ function CullThrottle._setVoxelsInLineToVisible(self: CullThrottle, startVoxel: 
 end
 
 function CullThrottle._intersectPlane(
-	self: CullThrottle,
+	_self: CullThrottle,
 	normal: Vector3,
 	center: Vector3,
 	origin: Vector3,
