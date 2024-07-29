@@ -250,6 +250,27 @@ function CullThrottle._setVoxelsInLineToVisible(self: CullThrottle, startVoxel: 
 	end
 end
 
+function CullThrottle._intersectPlane(
+	self: CullThrottle,
+	normal: Vector3,
+	center: Vector3,
+	origin: Vector3,
+	direction: Vector3,
+	length: number
+): number?
+	local denominator = normal:Dot(direction)
+	if math.abs(denominator) <= 1e-6 then
+		return nil
+	end
+
+	local t = (center - origin):Dot(normal) / denominator
+	if t >= 1e-7 and t <= length then
+		return t
+	end
+
+	return nil
+end
+
 function CullThrottle.setVoxelSize(self: CullThrottle, voxelSize: number)
 	self._voxelSize = voxelSize
 
@@ -375,6 +396,7 @@ function CullThrottle.getObjectsToUpdate(self: CullThrottle): () -> (Instance?, 
 		if CameraCache.FieldOfView < 70 then
 			renderDistance *= 2 - CameraCache.FieldOfView / 70
 		end
+		local distance2 = renderDistance / 2
 
 		local renderDistanceSq = renderDistance * renderDistance
 		local nearRefreshRate = self._nearRefreshRate
@@ -384,7 +406,6 @@ function CullThrottle.getObjectsToUpdate(self: CullThrottle): () -> (Instance?, 
 		local cameraPos = CameraCache.Position
 		local rightVec, upVec = cameraCFrame.RightVector, cameraCFrame.UpVector
 
-		local distance2 = self._halfRenderDistance
 		local farPlaneHeight2 = CameraCache.HalfTanFOV * renderDistance
 		local farPlaneWidth2 = farPlaneHeight2 * CameraCache.AspectRatio
 		local farPlaneCFrame = cameraCFrame * CFrame.new(0, 0, -renderDistance)
@@ -394,10 +415,23 @@ function CullThrottle.getObjectsToUpdate(self: CullThrottle): () -> (Instance?, 
 		local farPlaneBottomRight = farPlaneCFrame * Vector3.new(farPlaneWidth2, -farPlaneHeight2, 0)
 		local frustumCFrameInverse = (cameraCFrame * CFrame.new(0, 0, -distance2)):Inverse()
 
-		local rightNormal = upVec:Cross(farPlaneBottomRight - cameraPos).Unit
+		local rightNormal = upVec:Cross(cameraPos - farPlaneBottomRight).Unit
 		local leftNormal = upVec:Cross(farPlaneBottomLeft - cameraPos).Unit
-		local topNormal = rightVec:Cross(cameraPos - farPlaneTopRight).Unit
+		local topNormal = rightVec:Cross(farPlaneTopRight - cameraPos).Unit
 		local bottomNormal = rightVec:Cross(cameraPos - farPlaneBottomRight).Unit
+
+		local normals = {
+			rightNormal,
+			cameraPos,
+			leftNormal,
+			cameraPos,
+			cameraCFrame.LookVector,
+			farPlaneCFrame.Position,
+			topNormal,
+			cameraPos,
+			bottomNormal,
+			cameraPos,
+		}
 
 		local minBound = cameraPos
 			:Min(farPlaneTopLeft)
@@ -410,115 +444,83 @@ function CullThrottle.getObjectsToUpdate(self: CullThrottle): () -> (Instance?, 
 			:Max(farPlaneBottomLeft)
 			:Max(farPlaneBottomRight) // voxelSize
 
-		local function isVoxelKeyInView(voxelKey: Vector3): boolean
-			debug.profilebegin("isVoxelKeyInView")
-			-- Check if we already know the answer
-			if self._visibleVoxels[voxelKey] then
-				debug.profileend()
-				return true
-			end
-
-			local point = voxelKey * voxelSize
-
-			-- Check if point lies outside frustum OBB
-			local relativeToOBB = frustumCFrameInverse * point
-			if
-				relativeToOBB.X > farPlaneWidth2
-				or relativeToOBB.X < -farPlaneWidth2
-				or relativeToOBB.Y > farPlaneHeight2
-				or relativeToOBB.Y < -farPlaneHeight2
-				or relativeToOBB.Z > distance2
-				or relativeToOBB.Z < -distance2
-			then
-				debug.profileend()
-				return false
-			end
-
-			-- Check if point lies outside a frustum plane
-			local lookToCell = point - cameraPos
-			if
-				topNormal:Dot(lookToCell) < 0
-				or leftNormal:Dot(lookToCell) > 0
-				or rightNormal:Dot(lookToCell) < 0
-				or bottomNormal:Dot(lookToCell) > 0
-			then
-				debug.profileend()
-				return false
-			end
-
-			debug.profileend()
-			return true
-		end
-
 		debug.profilebegin("FindVisibleVoxels")
 
-		debug.profilebegin("setCameraVoxelVisible")
+		debug.profilebegin("SetCornerVoxels")
+		-- The camera and corners should always be inside
 		local cameraVoxelKey = cameraPos // voxelSize
-		local farPlaneVoxelKey = farPlaneCFrame.Position // voxelSize
-		local topLeftVoxelKey = farPlaneTopLeft // voxelSize
-		local topRightVoxelKey = farPlaneTopRight // voxelSize
-		local bottomLeftVoxelKey = farPlaneBottomLeft // voxelSize
-		local bottomRightVoxelKey = farPlaneBottomRight // voxelSize
-
-		-- The camera should always be inside
 		self:_setVoxelKeyVisible(cameraVoxelKey)
+		self:_setVoxelKeyVisible(farPlaneTopLeft // voxelSize)
+		self:_setVoxelKeyVisible(farPlaneTopRight // voxelSize)
+		self:_setVoxelKeyVisible(farPlaneBottomLeft // voxelSize)
+		self:_setVoxelKeyVisible(farPlaneBottomRight // voxelSize)
 		debug.profileend()
 
-		debug.profilebegin("setFrustumLinesVisible")
-		-- We know the voxels in straight in front of us will all be visible, so
-		-- we can skip expensive visiblity checks on them
-		self:_setVoxelsInLineToVisible(cameraVoxelKey, farPlaneVoxelKey)
-		-- We similarly know the voxels along the frustum edges are visible
-		self:_setVoxelsInLineToVisible(cameraVoxelKey, topLeftVoxelKey)
-		self:_setVoxelsInLineToVisible(cameraVoxelKey, topRightVoxelKey)
-		self:_setVoxelsInLineToVisible(cameraVoxelKey, bottomLeftVoxelKey)
-		self:_setVoxelsInLineToVisible(cameraVoxelKey, bottomRightVoxelKey)
-		self:_setVoxelsInLineToVisible(topLeftVoxelKey, bottomRightVoxelKey)
-		self:_setVoxelsInLineToVisible(topRightVoxelKey, bottomLeftVoxelKey)
-		self:_setVoxelsInLineToVisible(topLeftVoxelKey, bottomLeftVoxelKey)
-		self:_setVoxelsInLineToVisible(topRightVoxelKey, bottomRightVoxelKey)
-		debug.profileend()
+		-- Now we raycast and find where the ray enters and exits the frustum
+		-- and set all the voxels in between to visible
+		debug.profilebegin("RaycastFrustum")
+		local widthEpsilon = farPlaneWidth2 + 1e-4
+		local heightEpsilon = farPlaneHeight2 + 1e-4
+		local depthEpsilon = distance2 + 1e-4
+		local rayLength = (maxBound.Z - minBound.Z + 1) * voxelSize
+		local rayDirection = Vector3.zAxis
 
-		-- Now we have to actually search and fill in the frustum
-
-		debug.profilebegin("binarySearch")
 		for x = minBound.X, maxBound.X do
 			for y = minBound.Y, maxBound.Y do
-				for searchZ = minBound.Z, maxBound.Z do
-					-- We are looking for the first visible voxel in this row
-					if not isVoxelKeyInView(Vector3.new(x, y, searchZ)) then
-						continue
-					end
+				local rayOrigin = Vector3.new(x * voxelSize, y * voxelSize, minBound.Z * voxelSize)
 
-					-- Now that we have the first visible voxel, we need to find the last visible voxel.
-					-- Because the frustum is convex and contains no holes, we know that
-					-- the remainder of the row is sorted- inside the frustum, then outside.
-					-- This allows us to do a binary search to find the last voxel,
-					-- and then all voxels from here to there are inside the frustum.
-					local entry, exit = searchZ, minBound.Z - 1
-					local left = searchZ
-					local right = maxBound.Z
+				local nearestHitDist, secondNearestHitDist = math.huge, math.huge
+				local nearestPoint, secondNearestPoint = nil, nil
+				for i = 1, 10, 2 do
+					local normal, center = normals[i], normals[i + 1]
+					local dist = self:_intersectPlane(normal, center, rayOrigin, rayDirection, rayLength)
+					if dist then
+						local point = rayOrigin + rayDirection * dist
 
-					while left <= right do
-						local mid = (left + right) // 2
-						local midVoxelKey = Vector3.new(x, y, mid)
+						-- Check if point lies outside frustum OBB
+						local relativeToOBB = frustumCFrameInverse * point
+						if
+							relativeToOBB.X > widthEpsilon
+							or relativeToOBB.X < -widthEpsilon
+							or relativeToOBB.Y > heightEpsilon
+							or relativeToOBB.Y < -heightEpsilon
+							or relativeToOBB.Z > depthEpsilon
+							or relativeToOBB.Z < -depthEpsilon
+						then
+							continue
+						end
 
-						if isVoxelKeyInView(midVoxelKey) then
-							exit = mid
-							left = mid + 1
-						else
-							right = mid - 1
+						-- Check if point lies outside a frustum plane
+						local lookToCell = point - cameraPos
+						if
+							topNormal:Dot(lookToCell) > 1e-3
+							or leftNormal:Dot(lookToCell) > 1e-3
+							or rightNormal:Dot(lookToCell) > 1e-3
+							or bottomNormal:Dot(lookToCell) > 1e-3
+						then
+							continue
+						end
+
+						if dist < nearestHitDist then
+							secondNearestHitDist = nearestHitDist
+							secondNearestPoint = nearestPoint
+							nearestHitDist = dist
+							nearestPoint = point
+						elseif dist < secondNearestHitDist then
+							secondNearestHitDist = dist
+							secondNearestPoint = point
 						end
 					end
+				end
 
-					-- Add all the voxels from the entry to the exit
-					debug.profilebegin("setVoxelKeyVisible")
-					for z = entry, exit do
+				if nearestPoint and secondNearestPoint then
+					local startVoxel = nearestPoint // voxelSize
+					local endVoxel = secondNearestPoint // voxelSize
+
+					-- Now we can set all the voxels between the start and end voxel keys to visible
+					for z = startVoxel.Z, endVoxel.Z do
 						self:_setVoxelKeyVisible(Vector3.new(x, y, z))
 					end
-					debug.profileend()
-
-					break
 				end
 			end
 		end
@@ -545,6 +547,7 @@ function CullThrottle.getObjectsToUpdate(self: CullThrottle): () -> (Instance?, 
 			local refreshDelay = nearRefreshRate + (refreshRateRange * math.min(distSq / renderDistanceSq, 1))
 			debug.profileend()
 
+			debug.profilebegin("IterVoxelUpdates")
 			for _, object in voxel do
 				local objectData = self._objects[object]
 				if not objectData then
@@ -563,6 +566,7 @@ function CullThrottle.getObjectsToUpdate(self: CullThrottle): () -> (Instance?, 
 				coroutine.yield(object, elapsed)
 				objectData.lastUpdateClock = now
 			end
+			debug.profileend()
 		end
 		debug.profileend()
 

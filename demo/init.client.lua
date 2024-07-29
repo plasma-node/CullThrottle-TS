@@ -48,8 +48,8 @@ end)
 
 -- Each frame, we'll ask CullThrottle for all the objects that should be updated this frame,
 -- and then rotate them accordingly with BulkMoveTo.
-local ROT_SPEED = math.rad(90)
-local MOVE_AMOUNT = 10
+local ROT_SPEED = math.rad(120)
+local MOVE_AMOUNT = 15
 RunService.RenderStepped:Connect(function(frameDeltaTime)
 	local blocks, cframes = {}, {}
 	local now = os.clock() / 2
