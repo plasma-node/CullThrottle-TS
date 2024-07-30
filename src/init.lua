@@ -250,25 +250,82 @@ function CullThrottle._setVoxelsInLineToVisible(self: CullThrottle, startVoxel: 
 	end
 end
 
-function CullThrottle._intersectPlane(
+function CullThrottle._intersectTriangle(
+	_self: CullThrottle,
+	v0: Vector3,
+	v1: Vector3,
+	v2: Vector3,
+	rayOrigin: Vector3,
+	rayDirection: Vector3,
+	rayLength: number
+): (number?, Vector3?)
+	local edge1 = v1 - v0
+	local edge2 = v2 - v0
+
+	local h = rayDirection:Cross(edge2)
+	local a = h:Dot(edge1)
+
+	if a > -1e-6 and a < 1e-6 then
+		return -- The ray is parallel to the triangle
+	end
+
+	local f = 1.0 / a
+	local s = rayOrigin - v0
+	local u = f * s:Dot(h)
+
+	if u < 0.0 or u > 1.0 then
+		return -- The intersection is outside of the triangle
+	end
+
+	local q = s:Cross(edge1)
+	local v = f * rayDirection:Dot(q)
+
+	if v < 0.0 or u + v > 1.0 then
+		return -- The intersection is outside of the triangle
+	end
+
+	local t = f * q:Dot(edge2)
+
+	if t < 1e-6 or t > rayLength then
+		return -- Ray is behing ray or too far away
+	end
+
+	return t, rayOrigin + rayDirection * t
+end
+
+function CullThrottle._intersectRectangle(
 	_self: CullThrottle,
 	normal: Vector3,
 	center: Vector3,
-	origin: Vector3,
-	direction: Vector3,
-	length: number
-): number?
-	local denominator = normal:Dot(direction)
-	if math.abs(denominator) <= 1e-6 then
-		return nil
+	halfSizeX: number,
+	halfSizeY: number,
+	rayOrigin: Vector3,
+	rayDirection: Vector3,
+	rayLength: number
+): (number?, Vector3?)
+	local denominator = normal:Dot(rayDirection)
+	if denominator > -1e-6 and denominator < 1e-6 then
+		return
 	end
 
-	local t = (center - origin):Dot(normal) / denominator
-	if t >= 1e-7 and t <= length then
-		return t
+	local t = (center - rayOrigin):Dot(normal) / denominator
+	if t < 1e-6 or t > rayLength then
+		return
 	end
 
-	return nil
+	-- Now we know we've hit the plane, so now we test if it is within the rectangle
+	local p = rayOrigin + t * rayDirection
+	local relativeToCenter = p - center
+	if
+		relativeToCenter.X > halfSizeX
+		or relativeToCenter.X < -halfSizeX
+		or relativeToCenter.Y > halfSizeY
+		or relativeToCenter.Y < -halfSizeY
+	then
+		return
+	end
+
+	return t, p
 end
 
 function CullThrottle.setVoxelSize(self: CullThrottle, voxelSize: number)
@@ -396,7 +453,6 @@ function CullThrottle.getObjectsToUpdate(self: CullThrottle): () -> (Instance?, 
 		if CameraCache.FieldOfView < 70 then
 			renderDistance *= 2 - CameraCache.FieldOfView / 70
 		end
-		local distance2 = renderDistance / 2
 
 		local renderDistanceSq = renderDistance * renderDistance
 		local nearRefreshRate = self._nearRefreshRate
@@ -404,7 +460,6 @@ function CullThrottle.getObjectsToUpdate(self: CullThrottle): () -> (Instance?, 
 		local halfVoxelSizeVector = Vector3.one * (voxelSize / 2)
 		local cameraCFrame = CameraCache.CFrame
 		local cameraPos = CameraCache.Position
-		local rightVec, upVec = cameraCFrame.RightVector, cameraCFrame.UpVector
 
 		local farPlaneHeight2 = CameraCache.HalfTanFOV * renderDistance
 		local farPlaneWidth2 = farPlaneHeight2 * CameraCache.AspectRatio
@@ -413,24 +468,12 @@ function CullThrottle.getObjectsToUpdate(self: CullThrottle): () -> (Instance?, 
 		local farPlaneTopRight = farPlaneCFrame * Vector3.new(farPlaneWidth2, farPlaneHeight2, 0)
 		local farPlaneBottomLeft = farPlaneCFrame * Vector3.new(-farPlaneWidth2, -farPlaneHeight2, 0)
 		local farPlaneBottomRight = farPlaneCFrame * Vector3.new(farPlaneWidth2, -farPlaneHeight2, 0)
-		local frustumCFrameInverse = (cameraCFrame * CFrame.new(0, 0, -distance2)):Inverse()
 
-		local rightNormal = upVec:Cross(cameraPos - farPlaneBottomRight).Unit
-		local leftNormal = upVec:Cross(farPlaneBottomLeft - cameraPos).Unit
-		local topNormal = rightVec:Cross(farPlaneTopRight - cameraPos).Unit
-		local bottomNormal = rightVec:Cross(cameraPos - farPlaneBottomRight).Unit
-
-		local normals = {
-			rightNormal,
-			cameraPos,
-			leftNormal,
-			cameraPos,
-			cameraCFrame.LookVector,
-			farPlaneCFrame.Position,
-			topNormal,
-			cameraPos,
-			bottomNormal,
-			cameraPos,
+		local triangles = {
+			{ farPlaneTopLeft, farPlaneBottomLeft, cameraPos }, -- Left
+			{ farPlaneTopRight, farPlaneBottomRight, cameraPos }, -- Right
+			{ farPlaneTopLeft, farPlaneTopRight, cameraPos }, -- Top
+			{ farPlaneBottomRight, farPlaneBottomLeft, cameraPos }, -- Bottom
 		}
 
 		local minBound = cameraPos
@@ -459,9 +502,6 @@ function CullThrottle.getObjectsToUpdate(self: CullThrottle): () -> (Instance?, 
 		-- Now we raycast and find where the ray enters and exits the frustum
 		-- and set all the voxels in between to visible
 		debug.profilebegin("RaycastFrustum")
-		local widthEpsilon = farPlaneWidth2 + 1e-4
-		local heightEpsilon = farPlaneHeight2 + 1e-4
-		local depthEpsilon = distance2 + 1e-4
 		local rayLength = (maxBound.Z - minBound.Z + 1) * voxelSize
 		local rayDirection = Vector3.zAxis
 
@@ -469,53 +509,61 @@ function CullThrottle.getObjectsToUpdate(self: CullThrottle): () -> (Instance?, 
 			for y = minBound.Y, maxBound.Y do
 				local rayOrigin = Vector3.new(x * voxelSize, y * voxelSize, minBound.Z * voxelSize)
 
-				local nearestHitDist, secondNearestHitDist = math.huge, math.huge
-				local nearestPoint, secondNearestPoint = nil, nil
-				for i = 1, 10, 2 do
-					local normal, center = normals[i], normals[i + 1]
-					local dist = self:_intersectPlane(normal, center, rayOrigin, rayDirection, rayLength)
-					if dist then
-						local point = rayOrigin + rayDirection * dist
+				local nearestHitDist = math.huge
+				local nearestHitPoint, secondNearestHitPoint = nil, nil
 
-						-- Check if point lies outside frustum OBB
-						local relativeToOBB = frustumCFrameInverse * point
-						if
-							relativeToOBB.X > widthEpsilon
-							or relativeToOBB.X < -widthEpsilon
-							or relativeToOBB.Y > heightEpsilon
-							or relativeToOBB.Y < -heightEpsilon
-							or relativeToOBB.Z > depthEpsilon
-							or relativeToOBB.Z < -depthEpsilon
-						then
-							continue
+				-- Far plane is a rectangle, not a triangle
+				-- so we handle that one first
+				local hitFarPlaneDist, hitFarPlanePoint = self:_intersectRectangle(
+					cameraCFrame.LookVector,
+					farPlaneCFrame.Position,
+					farPlaneWidth2,
+					farPlaneHeight2,
+					rayOrigin,
+					rayDirection,
+					rayLength
+				)
+				if hitFarPlaneDist then
+					nearestHitDist = hitFarPlaneDist
+					nearestHitPoint = hitFarPlanePoint
+				end
+
+				for _, trianglePoints in triangles do
+					local hitDist, hitPoint = self:_intersectTriangle(
+						trianglePoints[1],
+						trianglePoints[2],
+						trianglePoints[3],
+						rayOrigin,
+						rayDirection,
+						rayLength
+					)
+					if not hitDist or not hitPoint then
+						continue
+					end
+
+					if not nearestHitPoint then
+						-- First hit
+						nearestHitDist = hitDist
+						nearestHitPoint = hitPoint
+					else
+						-- Second hit
+
+						-- Make sure they're ordered correctly
+						if hitDist < nearestHitDist then
+							secondNearestHitPoint = nearestHitPoint
+							nearestHitPoint = hitPoint
+						else
+							secondNearestHitPoint = hitPoint
 						end
 
-						-- Check if point lies outside a frustum plane
-						local lookToCell = point - cameraPos
-						if
-							topNormal:Dot(lookToCell) > 1e-3
-							or leftNormal:Dot(lookToCell) > 1e-3
-							or rightNormal:Dot(lookToCell) > 1e-3
-							or bottomNormal:Dot(lookToCell) > 1e-3
-						then
-							continue
-						end
-
-						if dist < nearestHitDist then
-							secondNearestHitDist = nearestHitDist
-							secondNearestPoint = nearestPoint
-							nearestHitDist = dist
-							nearestPoint = point
-						elseif dist < secondNearestHitDist then
-							secondNearestHitDist = dist
-							secondNearestPoint = point
-						end
+						-- We've found both entry and exit, no need to check the other triangles
+						break
 					end
 				end
 
-				if nearestPoint and secondNearestPoint then
-					local startVoxel = nearestPoint // voxelSize
-					local endVoxel = secondNearestPoint // voxelSize
+				if nearestHitPoint and secondNearestHitPoint then
+					local startVoxel = nearestHitPoint // voxelSize
+					local endVoxel = secondNearestHitPoint // voxelSize
 
 					-- Now we can set all the voxels between the start and end voxel keys to visible
 					for z = startVoxel.Z, endVoxel.Z do
@@ -538,16 +586,13 @@ function CullThrottle.getObjectsToUpdate(self: CullThrottle): () -> (Instance?, 
 			-- Instead of throttling updates for each object by distance, we approximate by computing the distance
 			-- to the voxel center. This gives us less precise throttling, but saves a ton of compute
 			-- and scales on voxel size instead of object count.
-			debug.profilebegin("DistanceThrottling")
 			local voxelWorldPos = (voxelKey * voxelSize) + halfVoxelSizeVector
 			local dx = cameraPos.X - voxelWorldPos.X
 			local dy = cameraPos.Y - voxelWorldPos.Y
 			local dz = cameraPos.Z - voxelWorldPos.Z
 			local distSq = dx * dx + dy * dy + dz * dz
 			local refreshDelay = nearRefreshRate + (refreshRateRange * math.min(distSq / renderDistanceSq, 1))
-			debug.profileend()
 
-			debug.profilebegin("IterVoxelUpdates")
 			for _, object in voxel do
 				local objectData = self._objects[object]
 				if not objectData then
@@ -566,8 +611,8 @@ function CullThrottle.getObjectsToUpdate(self: CullThrottle): () -> (Instance?, 
 				coroutine.yield(object, elapsed)
 				objectData.lastUpdateClock = now
 			end
-			debug.profileend()
 		end
+
 		debug.profileend()
 
 		return
