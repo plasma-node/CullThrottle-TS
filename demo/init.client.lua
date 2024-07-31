@@ -14,7 +14,7 @@ for _ = 1, 100 do
 	for _ = 1, 100 do
 		local part = Instance.new("Part")
 		part.Size = Vector3.new(5, 5, 5)
-		part.Color = Color3.fromHSV(math.random(), 0.5, 1)
+		part.Color = Color3.new() -- Color3.fromHSV(math.random(), 0.5, 1)
 		part.CFrame = CFrame.new(
 			groupOrigin + Vector3.new(math.random(-100, 100), math.random(-50, 50), math.random(-100, 100))
 		) * CFrame.Angles(math.rad(math.random(360)), math.rad(math.random(360)), math.rad(math.random(360)))
@@ -46,30 +46,20 @@ CollectionService:GetInstanceRemovedSignal("FloatingBlock"):Connect(function(blo
 	FloatingBlocksUpdater:remove(block)
 end)
 
--- Each frame, we'll ask CullThrottle for all the objects that should be updated this frame,
--- and then rotate them accordingly with BulkMoveTo.
-local ROT_SPEED = math.rad(120)
-local MOVE_AMOUNT = 15
-RunService.RenderStepped:Connect(function(frameDeltaTime)
-	local blocks, cframes = {}, {}
-	local now = os.clock() / 2
-	local movement = math.sin(now) * MOVE_AMOUNT
-	for block, objectDeltaTime in FloatingBlocksUpdater:getObjectsToUpdate() do
-		if objectDeltaTime > 0.4 then
-			-- This object hasn't been updated in a while, so if we were to animate
-			-- it based on the objectDT, it would jump to where it "should" be now.
-			-- For our purposes, we'd rather it just pick up from where it is and avoid popping
-			objectDeltaTime = frameDeltaTime
-		end
-
-		table.insert(blocks, block)
-		table.insert(
-			cframes,
-			block.CFrame
-				* CFrame.new(0, movement * objectDeltaTime, 0)
-				* CFrame.Angles(0, ROT_SPEED * objectDeltaTime, 0)
-		)
+local lastVisible = {}
+RunService.RenderStepped:Connect(function()
+	local newVisible = {}
+	for block in FloatingBlocksUpdater:getObjectsInView() do
+		newVisible[block] = true
+		block.Color = Color3.new(1, 1, 1)
 	end
 
-	workspace:BulkMoveTo(blocks, cframes, Enum.BulkMoveMode.FireCFrameChanged)
+	-- Get the objects that were visible last frame but not this frame
+	for block in lastVisible do
+		if not newVisible[block] then
+			block.Color = Color3.new(0, 0, 0)
+		end
+	end
+
+	lastVisible = newVisible
 end)
