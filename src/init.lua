@@ -187,21 +187,23 @@ function CullThrottle._intersectTriangle(
 	local s = rayOrigin - v0
 	local u = f * s:Dot(h)
 
-	if u < 0.0 or u > 1.0 then
+	local oneEpsilon = 1 + 1e-6
+
+	if u < -1e-6 or u > oneEpsilon then
 		return -- The intersection is outside of the triangle
 	end
 
 	local q = s:Cross(edge1)
 	local v = f * rayDirection:Dot(q)
 
-	if v < 0.0 or u + v > 1.0 then
+	if v < -1e-6 or u + v > oneEpsilon then
 		return -- The intersection is outside of the triangle
 	end
 
 	local t = f * q:Dot(edge2)
 
-	if t < 1e-6 or t > rayLength then
-		return -- Ray is behing ray or too far away
+	if t < -1e-6 or t > rayLength then
+		return -- Intersection is behind ray or too far away
 	end
 
 	return t, rayOrigin + rayDirection * t
@@ -275,6 +277,59 @@ function CullThrottle._addVoxelsAroundVertex(_self: CullThrottle, vertex: Vector
 	keyTable[Vector3.new(x - 1, y - 1, z - 1)] = true
 end
 
+function CullThrottle._edgeIntersectsMesh(
+	self: CullThrottle,
+	v0: Vector3,
+	v1: Vector3,
+	triangleVertices: { { Vector3 } }
+)
+	local direction = (v1 - v0).Unit
+	local length = self._voxelSize
+
+	for _, triangle in triangleVertices do
+		if self:_intersectTriangle(triangle[1], triangle[2], triangle[3], v0, direction, length) then
+			return true
+		end
+	end
+
+	return false
+end
+
+function CullThrottle._distToTriangle(
+	_self: CullThrottle,
+	triV0: Vector3,
+	triV1: Vector3,
+	triV2: Vector3,
+	normal: Vector3,
+	position: Vector3,
+	point: Vector3
+)
+	-- Projection of vector from planePoint to the given point onto the plane normal
+	local projectionLength = (point - position):Dot(normal)
+	local projectedPoint = point - normal * projectionLength
+
+	-- Check if the projected point is within the triangle
+	local v0 = triV2 - triV0
+	local v1 = triV1 - triV0
+	local v2 = projectedPoint - triV0
+
+	local dot00 = v0:Dot(v0)
+	local dot01 = v0:Dot(v1)
+	local dot02 = v0:Dot(v2)
+	local dot11 = v1:Dot(v1)
+	local dot12 = v1:Dot(v2)
+
+	local invDenom = 1 / (dot00 * dot11 - dot01 * dot01)
+	local u = (dot11 * dot02 - dot01 * dot12) * invDenom
+	local v = (dot00 * dot12 - dot01 * dot02) * invDenom
+
+	if (u >= 0) and (v >= 0) and (u + v < 1) then
+		return math.abs(projectionLength)
+	end
+
+	return math.huge
+end
+
 function CullThrottle._getVisibleVoxelKeys(self: CullThrottle): { [Vector3]: true }
 	local visibleVoxelKeys = {}
 
@@ -294,98 +349,201 @@ function CullThrottle._getVisibleVoxelKeys(self: CullThrottle): { [Vector3]: tru
 	local farPlaneHeight2 = CameraCache.HalfTanFOV * renderDistance
 	local farPlaneWidth2 = farPlaneHeight2 * CameraCache.AspectRatio
 	local farPlaneCFrame = cameraCFrame * CFrame.new(0, 0, -renderDistance)
+	local farPlanePos = farPlaneCFrame.Position
 	local farPlaneTopLeft = farPlaneCFrame * Vector3.new(-farPlaneWidth2, farPlaneHeight2, 0)
 	local farPlaneTopRight = farPlaneCFrame * Vector3.new(farPlaneWidth2, farPlaneHeight2, 0)
 	local farPlaneBottomLeft = farPlaneCFrame * Vector3.new(-farPlaneWidth2, -farPlaneHeight2, 0)
 	local farPlaneBottomRight = farPlaneCFrame * Vector3.new(farPlaneWidth2, -farPlaneHeight2, 0)
 
-	local triangles = {
-		{ farPlaneTopLeft, farPlaneBottomLeft, cameraPos }, -- Left
-		{ farPlaneTopRight, farPlaneBottomRight, cameraPos }, -- Right
-		{ farPlaneTopLeft, farPlaneTopRight, cameraPos }, -- Top
-		{ farPlaneBottomRight, farPlaneBottomLeft, cameraPos }, -- Bottom
+	local upVec, rightVec, lookVec = cameraCFrame.UpVector, cameraCFrame.RightVector, cameraCFrame.LookVector
+
+	local rightNormal = upVec:Cross(cameraPos - farPlaneBottomRight).Unit
+	local leftNormal = upVec:Cross(farPlaneBottomLeft - cameraPos).Unit
+	local topNormal = rightVec:Cross(farPlaneTopRight - cameraPos).Unit
+	local bottomNormal = rightVec:Cross(cameraPos - farPlaneBottomRight).Unit
+
+	local triangleVertices = {
+		{ farPlaneTopLeft, farPlaneBottomLeft, cameraPos, leftNormal, cameraPos }, -- Left
+		{ farPlaneTopRight, cameraPos, farPlaneBottomRight, rightNormal, cameraPos }, -- Right
+		{ farPlaneTopLeft, cameraPos, farPlaneTopRight, topNormal, cameraPos }, -- Top
+		{ farPlaneBottomRight, cameraPos, farPlaneBottomLeft, bottomNormal, cameraPos }, -- Bottom
+		{ farPlaneTopLeft, farPlaneTopRight, farPlaneBottomLeft, lookVec, farPlanePos }, -- Front 1
+		{ farPlaneBottomLeft, farPlaneTopRight, farPlaneBottomRight, lookVec, farPlanePos }, -- Front 2
 	}
 
-	local minBound = cameraPos
-		:Min(farPlaneTopLeft)
-		:Min(farPlaneTopRight)
-		:Min(farPlaneBottomLeft)
-		:Min(farPlaneBottomRight) // voxelSize
-	local maxBound = cameraPos
-		:Max(farPlaneTopLeft)
-		:Max(farPlaneTopRight)
-		:Max(farPlaneBottomLeft)
-		:Max(farPlaneBottomRight) // voxelSize
+	local function isVoxelInFrustum(x: number, y: number, z: number): boolean
+		local v0 = Vector3.new(x * voxelSize, y * voxelSize, z * voxelSize)
+		if visibleVoxelKeys[v0] then
+			return true
+		end
+
+		local v7 = Vector3.new((x + 1) * voxelSize, (y + 1) * voxelSize, (z + 1) * voxelSize)
+
+		local vertices = {
+			v0,
+			Vector3.new(v0.X, v0.Y, v7.Z),
+			Vector3.new(v0.X, v7.Y, v0.Z),
+			Vector3.new(v0.X, v7.Y, v7.Z),
+			Vector3.new(v7.X, v0.Y, v0.Z),
+			Vector3.new(v7.X, v0.Y, v7.Z),
+			Vector3.new(v7.X, v7.Y, v0.Z),
+			v7,
+		}
+
+		debug.profilebegin("checkNormals")
+		for _, vertex in vertices do
+			-- Check if point lies outside a frustum plane
+			local camToVoxel = vertex - cameraPos
+			local insideTris = topNormal:Dot(camToVoxel) < -1e-6
+				and leftNormal:Dot(camToVoxel) < -1e-6
+				and rightNormal:Dot(camToVoxel) < -1e-6
+				and bottomNormal:Dot(camToVoxel) < -1e-6
+
+			if not insideTris then
+				-- Don't bother computing the far plane, we're already outside
+				continue
+			end
+
+			local farPlaneToVoxel = vertex - farPlanePos
+			if lookVec:Dot(farPlaneToVoxel) < -1e-6 then
+				debug.profileend()
+				return true
+			end
+		end
+		debug.profileend()
+
+		debug.profilebegin("checkDistanceToTris")
+		local center = Vector3.new((x + 0.5) * voxelSize, (y + 0.5) * voxelSize, (z + 0.5) * voxelSize)
+		local shouldCheckEdges = false
+		for _, triangle in triangleVertices do
+			if
+				self:_distToTriangle(triangle[1], triangle[2], triangle[3], triangle[4], triangle[5], center)
+				< voxelSize
+			then
+				shouldCheckEdges = true
+				break
+			end
+		end
+		debug.profileend()
+
+		if not shouldCheckEdges then
+			-- We're too far from all planes to have an edge intersecting
+			return false
+		end
+
+		debug.profilebegin("edgeIntersections")
+		if
+			self:_edgeIntersectsMesh(v0, vertices[2], triangleVertices)
+			or self:_edgeIntersectsMesh(v0, vertices[3], triangleVertices)
+			or self:_edgeIntersectsMesh(v0, vertices[5], triangleVertices)
+			or self:_edgeIntersectsMesh(v7, vertices[4], triangleVertices)
+			or self:_edgeIntersectsMesh(v7, vertices[6], triangleVertices)
+			or self:_edgeIntersectsMesh(v7, vertices[7], triangleVertices)
+			or self:_edgeIntersectsMesh(vertices[2], vertices[6], triangleVertices)
+			or self:_edgeIntersectsMesh(vertices[2], vertices[4], triangleVertices)
+			or self:_edgeIntersectsMesh(vertices[3], vertices[4], triangleVertices)
+			or self:_edgeIntersectsMesh(vertices[5], vertices[6], triangleVertices)
+			or self:_edgeIntersectsMesh(vertices[7], vertices[3], triangleVertices)
+		then
+			debug.profileend()
+			return true
+		end
+		debug.profileend()
+		return false
+	end
 
 	debug.profilebegin("FindVisibleVoxels")
 
 	debug.profilebegin("SetCornerVoxels")
 	-- The camera and corners should always be inside
-	self:_addVoxelsAroundVertex(cameraPos // voxelSize, visibleVoxelKeys)
-	self:_addVoxelsAroundVertex(farPlaneTopLeft // voxelSize, visibleVoxelKeys)
-	self:_addVoxelsAroundVertex(farPlaneTopRight // voxelSize, visibleVoxelKeys)
-	self:_addVoxelsAroundVertex(farPlaneBottomLeft // voxelSize, visibleVoxelKeys)
-	self:_addVoxelsAroundVertex(farPlaneBottomRight // voxelSize, visibleVoxelKeys)
+	self:_addVoxelsAroundVertex(cameraPos // voxelSize + Vector3.one, visibleVoxelKeys)
+	self:_addVoxelsAroundVertex(farPlaneTopLeft // voxelSize + Vector3.one, visibleVoxelKeys)
+	self:_addVoxelsAroundVertex(farPlaneTopRight // voxelSize + Vector3.one, visibleVoxelKeys)
+	self:_addVoxelsAroundVertex(farPlaneBottomLeft // voxelSize + Vector3.one, visibleVoxelKeys)
+	self:_addVoxelsAroundVertex(farPlaneBottomRight // voxelSize + Vector3.one, visibleVoxelKeys)
 	debug.profileend()
 
-	-- Now we raycast and find where the ray enters and exits the frustum
-	-- and set all the voxels in between to visible
-	debug.profilebegin("RaycastFrustum")
-	local rayLength = (maxBound.Z - minBound.Z + 1) * voxelSize
-	local rayDirection = Vector3.zAxis
+	local minX = math.min(
+		cameraPos.X,
+		farPlaneTopLeft.X,
+		farPlaneTopRight.X,
+		farPlaneBottomLeft.X,
+		farPlaneBottomRight.X
+	) // voxelSize
+	local maxX = math.max(
+		cameraPos.X,
+		farPlaneTopLeft.X,
+		farPlaneTopRight.X,
+		farPlaneBottomLeft.X,
+		farPlaneBottomRight.X
+	) // voxelSize
+	local minY = math.min(
+		cameraPos.Y,
+		farPlaneTopLeft.Y,
+		farPlaneTopRight.Y,
+		farPlaneBottomLeft.Y,
+		farPlaneBottomRight.Y
+	) // voxelSize
+	local maxY = math.max(
+		cameraPos.Y,
+		farPlaneTopLeft.Y,
+		farPlaneTopRight.Y,
+		farPlaneBottomLeft.Y,
+		farPlaneBottomRight.Y
+	) // voxelSize
+	local minZ = math.min(
+		cameraPos.Z,
+		farPlaneTopLeft.Z,
+		farPlaneTopRight.Z,
+		farPlaneBottomLeft.Z,
+		farPlaneBottomRight.Z
+	) // voxelSize
+	local maxZ = math.max(
+		cameraPos.Z,
+		farPlaneTopLeft.Z,
+		farPlaneTopRight.Z,
+		farPlaneBottomLeft.Z,
+		farPlaneBottomRight.Z
+	) // voxelSize
 
-	for x = minBound.X, maxBound.X do
-		for y = minBound.Y, maxBound.Y do
-			local rayOrigin = Vector3.new(x * voxelSize, y * voxelSize, minBound.Z * voxelSize)
-
-			local firstHit, secondHit = nil, nil
-
-			-- Far plane is a rectangle, not a triangle
-			-- so we handle that one first
-			local hitFarPlaneDist, hitFarPlanePoint = self:_intersectRectangle(
-				cameraCFrame.LookVector,
-				farPlaneCFrame.Position,
-				farPlaneWidth2,
-				farPlaneHeight2,
-				rayOrigin,
-				rayDirection,
-				rayLength
-			)
-			if hitFarPlaneDist then
-				firstHit = hitFarPlanePoint
-			end
-
-			for _, trianglePoints in triangles do
-				local hitDist, hitPoint = self:_intersectTriangle(
-					trianglePoints[1],
-					trianglePoints[2],
-					trianglePoints[3],
-					rayOrigin,
-					rayDirection,
-					rayLength
-				)
-				if not hitDist or not hitPoint then
+	-- Now we need to check all voxels within the min and max bounds
+	debug.profilebegin("BinarySearch")
+	for x = minX, maxX do
+		for y = minY, maxY do
+			for searchZ = minZ, maxZ do
+				-- We are looking for the first visible voxel in this row
+				if not isVoxelInFrustum(x, y, searchZ) then
 					continue
 				end
 
-				if not firstHit then
-					-- First hit
-					firstHit = hitPoint
-				else
-					-- Second hit
-					secondHit = hitPoint
-					-- We've found both entry and exit, no need to check the other triangles
-					break
-				end
-			end
+				-- Now that we have the first visible voxel, we need to find the last visible voxel.
+				-- Because the frustum is convex and contains no holes, we know that
+				-- the remainder of the row is sorted- inside the frustum, then outside.
+				-- This allows us to do a binary search to find the last voxel,
+				-- and then all voxels from here to there are inside the frustum.
+				local entry, exit = searchZ, minZ - 1
+				local left = searchZ
+				local right = maxZ
 
-			if firstHit and secondHit then
-				local firstHitZ = firstHit.Z // voxelSize
-				local secondHitZ = secondHit.Z // voxelSize
-				-- Now we can set all the voxels between the start and end voxel keys to visible
-				for z = math.min(firstHitZ, secondHitZ), math.max(firstHitZ, secondHitZ) do
-					self:_addVoxelsAroundVertex(Vector3.new(x, y, z), visibleVoxelKeys)
+				while left <= right do
+					local mid = (left + right) // 2
+
+					if isVoxelInFrustum(x, y, mid) then
+						exit = mid
+						left = mid + 1
+					else
+						right = mid - 1
+					end
 				end
+
+				-- Add all the voxels from the entry to the exit
+				for z = entry, exit do
+					self:_addVoxelsAroundVertex(Vector3.new(x, y, z), visibleVoxelKeys)
+					-- visibleVoxelKeys[Vector3.new(x, y, z)] = true
+				end
+
+				-- This row is complete, we don't need to scan further
+				break
 			end
 		end
 	end
