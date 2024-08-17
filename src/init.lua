@@ -10,6 +10,8 @@ end
 local PriorityQueue = require(script.PriorityQueue)
 local CameraCache = require(script.CameraCache)
 
+local EPSILON = 1e-4
+
 local CullThrottle = {}
 CullThrottle.__index = CullThrottle
 
@@ -18,9 +20,9 @@ type CullThrottleProto = {
 	_nearRefreshRate: number,
 	_refreshRateRange: number,
 	_renderDistance: number,
-	_halfRenderDistance: number,
 	_renderDistanceSq: number,
 	_voxelSize: number,
+	_halfVoxelSizeVec: Vector3,
 	_voxels: { [Vector3]: { Instance } },
 	_objects: {
 		[Instance]: {
@@ -39,12 +41,12 @@ export type CullThrottle = typeof(setmetatable({} :: CullThrottleProto, CullThro
 function CullThrottle.new(): CullThrottle
 	local self = setmetatable({}, CullThrottle)
 
-	self._voxelSize = 75
+	self._voxelSize = 90
+	self._halfVoxelSizeVec = Vector3.one * (self._voxelSize / 2)
 	self._farRefreshRate = 1 / 15
 	self._nearRefreshRate = 1 / 45
 	self._refreshRateRange = self._farRefreshRate - self._nearRefreshRate
-	self._renderDistance = 600
-	self._halfRenderDistance = self._renderDistance / 2
+	self._renderDistance = 450
 	self._renderDistanceSq = self._renderDistance * self._renderDistance
 	self._voxels = {}
 	self._objects = {}
@@ -164,86 +166,6 @@ function CullThrottle._removeFromVoxel(self: CullThrottle, voxelKey: Vector3, ob
 	end
 end
 
-function CullThrottle._intersectTriangle(
-	_self: CullThrottle,
-	v0: Vector3,
-	v1: Vector3,
-	v2: Vector3,
-	rayOrigin: Vector3,
-	rayDirection: Vector3,
-	rayLength: number
-): (number?, Vector3?)
-	local edge1 = v1 - v0
-	local edge2 = v2 - v0
-
-	local h = rayDirection:Cross(edge2)
-	local a = h:Dot(edge1)
-
-	if a > -1e-6 and a < 1e-6 then
-		return -- The ray is parallel to the triangle
-	end
-
-	local f = 1.0 / a
-	local s = rayOrigin - v0
-	local u = f * s:Dot(h)
-
-	local oneEpsilon = 1 + 1e-6
-
-	if u < -1e-6 or u > oneEpsilon then
-		return -- The intersection is outside of the triangle
-	end
-
-	local q = s:Cross(edge1)
-	local v = f * rayDirection:Dot(q)
-
-	if v < -1e-6 or u + v > oneEpsilon then
-		return -- The intersection is outside of the triangle
-	end
-
-	local t = f * q:Dot(edge2)
-
-	if t < -1e-6 or t > rayLength then
-		return -- Intersection is behind ray or too far away
-	end
-
-	return t, rayOrigin + rayDirection * t
-end
-
-function CullThrottle._intersectRectangle(
-	_self: CullThrottle,
-	normal: Vector3,
-	center: Vector3,
-	halfSizeX: number,
-	halfSizeY: number,
-	rayOrigin: Vector3,
-	rayDirection: Vector3,
-	rayLength: number
-): (number?, Vector3?)
-	local denominator = normal:Dot(rayDirection)
-	if denominator > -1e-6 and denominator < 1e-6 then
-		return
-	end
-
-	local t = (center - rayOrigin):Dot(normal) / denominator
-	if t < 1e-6 or t > rayLength then
-		return
-	end
-
-	-- Now we know we've hit the plane, so now we test if it is within the rectangle
-	local p = rayOrigin + t * rayDirection
-	local relativeToCenter = p - center
-	if
-		relativeToCenter.X > halfSizeX
-		or relativeToCenter.X < -halfSizeX
-		or relativeToCenter.Y > halfSizeY
-		or relativeToCenter.Y < -halfSizeY
-	then
-		return
-	end
-
-	return t, p
-end
-
 function CullThrottle._processObjectRefreshQueue(self: CullThrottle, time_limit: number)
 	debug.profilebegin("ObjectRefreshQueue")
 	local now = os.clock()
@@ -262,300 +184,327 @@ function CullThrottle._processObjectRefreshQueue(self: CullThrottle, time_limit:
 	debug.profileend()
 end
 
-function CullThrottle._addVoxelsAroundVertex(_self: CullThrottle, vertex: Vector3, keyTable: { [Vector3]: true })
-	keyTable[vertex] = true
-
-	-- All the voxels that share this vertex
-	-- must also visible (at least partially).
-	local x, y, z = vertex.X, vertex.Y, vertex.Z
-	keyTable[Vector3.new(x - 1, y, z)] = true
-	keyTable[Vector3.new(x, y - 1, z)] = true
-	keyTable[Vector3.new(x, y, z - 1)] = true
-	keyTable[Vector3.new(x - 1, y - 1, z)] = true
-	keyTable[Vector3.new(x - 1, y, z - 1)] = true
-	keyTable[Vector3.new(x, y - 1, z - 1)] = true
-	keyTable[Vector3.new(x - 1, y - 1, z - 1)] = true
-end
-
-function CullThrottle._edgeIntersectsMesh(
+-- Function to check if a box is inside a frustum using SAT
+function CullThrottle._isBoxInFrustum(
 	self: CullThrottle,
-	v0: Vector3,
-	v1: Vector3,
-	triangleVertices: { { Vector3 } }
-)
-	local direction = (v1 - v0).Unit
-	local length = self._voxelSize
+	frustumPlanes: { Vector3 },
+	x0: number,
+	y0: number,
+	z0: number,
+	x1: number,
+	y1: number,
+	z1: number
+): (boolean, boolean)
+	debug.profilebegin("isBoxInFrustum")
+	local voxelSize = self._voxelSize
 
-	for _, triangle in triangleVertices do
-		if self:_intersectTriangle(triangle[1], triangle[2], triangle[3], v0, direction, length) then
-			return true
+	-- Convert the box bounds into the 8 corners of the box in world space
+	local corners = {
+		Vector3.new(x0, y0, z0) * voxelSize,
+		Vector3.new(x1, y0, z0) * voxelSize,
+		Vector3.new(x0, y1, z0) * voxelSize,
+		Vector3.new(x1, y1, z0) * voxelSize,
+		Vector3.new(x0, y0, z1) * voxelSize,
+		Vector3.new(x1, y0, z1) * voxelSize,
+		Vector3.new(x0, y1, z1) * voxelSize,
+		Vector3.new(x1, y1, z1) * voxelSize,
+	}
+
+	local isBoxInside = true
+	local isBoxCompletelyInside = true
+
+	for i = 1, #frustumPlanes, 2 do
+		local pos, normal = frustumPlanes[i], frustumPlanes[i + 1]
+		local allCornersOutside = true
+		local allCornersInside = true
+
+		-- Check the position of each corner relative to the plane
+		for _, corner in corners do
+			-- Check if corner lies outside the frustum plane
+			local cornerToPlane = corner - pos
+			if normal:Dot(cornerToPlane) <= EPSILON then
+				-- This corner is inside
+				allCornersOutside = false
+			else
+				allCornersInside = false
+			end
+		end
+
+		if allCornersOutside then
+			-- If all corners are outside any plane, the box is outside the frustum
+			isBoxInside = false
+			isBoxCompletelyInside = false
+			break -- No need to check the other planes
+		end
+
+		-- If any corner is outside this plane, the box is not completely inside
+		if not allCornersInside then
+			isBoxCompletelyInside = false
 		end
 	end
 
-	return false
+	debug.profileend()
+	return isBoxInside, isBoxCompletelyInside
 end
 
-function CullThrottle._distToTriangle(
-	_self: CullThrottle,
-	triV0: Vector3,
-	triV1: Vector3,
-	triV2: Vector3,
-	normal: Vector3,
-	position: Vector3,
-	point: Vector3
+function CullThrottle._processVoxel(
+	self: CullThrottle,
+	now: number,
+	shouldDistThrottle: boolean,
+	voxelKey: Vector3,
+	voxelSize: number,
+	halfVoxelSizeVec: Vector3,
+	cameraPos: Vector3,
+	nearRefreshRate: number,
+	refreshRateRange: number,
+	renderDistanceSq: number
 )
-	-- Projection of vector from planePoint to the given point onto the plane normal
-	local projectionLength = (point - position):Dot(normal)
-	local projectedPoint = point - normal * projectionLength
-
-	-- Check if the projected point is within the triangle
-	local v0 = triV2 - triV0
-	local v1 = triV1 - triV0
-	local v2 = projectedPoint - triV0
-
-	local dot00 = v0:Dot(v0)
-	local dot01 = v0:Dot(v1)
-	local dot02 = v0:Dot(v2)
-	local dot11 = v1:Dot(v1)
-	local dot12 = v1:Dot(v2)
-
-	local invDenom = 1 / (dot00 * dot11 - dot01 * dot01)
-	local u = (dot11 * dot02 - dot01 * dot12) * invDenom
-	local v = (dot00 * dot12 - dot01 * dot02) * invDenom
-
-	if (u >= 0) and (v >= 0) and (u + v < 1) then
-		return math.abs(projectionLength)
+	local voxel = self._voxels[voxelKey]
+	if not voxel then
+		return
 	end
 
-	return math.huge
+	if not shouldDistThrottle then
+		for _, object in voxel do
+			coroutine.yield(object)
+		end
+		return
+	end
+
+	-- Instead of distance per object, we approximate by computing the distance
+	-- to the voxel center. This gives us less precise throttling, but saves a ton of compute
+	-- and scales on voxel size instead of object count.
+	local voxelWorldPos = voxelKey * voxelSize + halfVoxelSizeVec
+	local voxelDistanceSq = (
+		(voxelWorldPos.X - cameraPos.X) ^ 2
+		+ (voxelWorldPos.Y - cameraPos.Y) ^ 2
+		+ (voxelWorldPos.Z - cameraPos.Z) ^ 2
+	)
+
+	local refreshDelay = nearRefreshRate + (refreshRateRange * math.min(voxelDistanceSq / renderDistanceSq, 1))
+	for _, object in voxel do
+		local objectData = self._objects[object]
+		if not objectData then
+			continue
+		end
+
+		-- We add jitter to the timings so we don't end up with
+		-- spikes of every object in the voxel updating on the same frame
+		local elapsed = now - objectData.lastUpdateClock
+		local jitter = math.random() / 150
+		if elapsed + jitter <= refreshDelay then
+			-- It is not yet time to update this one
+			continue
+		end
+
+		debug.profilebegin("userObjectUpdate")
+		coroutine.yield(object, elapsed)
+		debug.profileend()
+
+		objectData.lastUpdateClock = now
+	end
 end
 
-function CullThrottle._getVisibleVoxelKeys(self: CullThrottle): { [Vector3]: true }
-	local visibleVoxelKeys = {}
-
-	-- Make sure our voxels are up to date
-	self:_processObjectRefreshQueue(0.0001)
-
-	local voxelSize = self._voxelSize
-	local renderDistance = self._renderDistance
-	-- For smaller FOVs, we increase render distance
-	if CameraCache.FieldOfView < 70 then
-		renderDistance *= 2 - CameraCache.FieldOfView / 70
+function CullThrottle._getFrustumVoxelsInVolume(
+	self: CullThrottle,
+	frustumPlanes: { Vector3 },
+	x0: number,
+	y0: number,
+	z0: number,
+	x1: number,
+	y1: number,
+	z1: number,
+	callback: (Vector3) -> ()
+)
+	local isInside, isCompletelyInside = self:_isBoxInFrustum(frustumPlanes, x0, y0, z0, x1, y1, z1)
+	-- Exit case: if the box is outside the frustum, don't split further
+	if not isInside then
+		return
 	end
 
+	-- Base case: if the box is a single voxel, it cannot be split further
+	if x1 - x0 == 1 and y1 - y0 == 1 and z1 - z0 == 1 then
+		callback(Vector3.new(x0, y0, z0))
+		return
+	end
+
+	-- Lucky case: if the box is entirely inside, then we know all voxels contained inside are in the frustum
+	-- and we can process them now and not split further
+	if isCompletelyInside then
+		for x = x0, x1 - 1 do
+			for y = y0, y1 - 1 do
+				for z = z0, z1 - 1 do
+					callback(Vector3.new(x, y, z))
+				end
+			end
+		end
+		return
+	end
+
+	-- Calculate the lengths of each axis
+	local lengthX = x1 - x0
+	local lengthY = y1 - y0
+	local lengthZ = z1 - z0
+
+	-- Split along the axis with the greatest length
+	if lengthX >= lengthY and lengthX >= lengthZ then
+		local splitCoord = (x0 + x1) // 2
+		self:_getFrustumVoxelsInVolume(frustumPlanes, x0, y0, z0, splitCoord, y1, z1, callback)
+		self:_getFrustumVoxelsInVolume(frustumPlanes, splitCoord, y0, z0, x1, y1, z1, callback)
+	elseif lengthY >= lengthX and lengthY >= lengthZ then
+		local splitCoord = (y0 + y1) // 2
+		self:_getFrustumVoxelsInVolume(frustumPlanes, x0, y0, z0, x1, splitCoord, z1, callback)
+		self:_getFrustumVoxelsInVolume(frustumPlanes, x0, splitCoord, z0, x1, y1, z1, callback)
+	else
+		local splitCoord = (z0 + z1) // 2
+		self:_getFrustumVoxelsInVolume(frustumPlanes, x0, y0, z0, x1, y1, splitCoord, callback)
+		self:_getFrustumVoxelsInVolume(frustumPlanes, x0, y0, splitCoord, x1, y1, z1, callback)
+	end
+end
+
+function CullThrottle._getPlanesAndBounds(
+	_self: CullThrottle,
+	renderDistance: number,
+	voxelSize: number
+): ({ Vector3 }, Vector3, Vector3)
 	local cameraCFrame = CameraCache.CFrame
 	local cameraPos = CameraCache.Position
 
 	local farPlaneHeight2 = CameraCache.HalfTanFOV * renderDistance
 	local farPlaneWidth2 = farPlaneHeight2 * CameraCache.AspectRatio
 	local farPlaneCFrame = cameraCFrame * CFrame.new(0, 0, -renderDistance)
-	local farPlanePos = farPlaneCFrame.Position
 	local farPlaneTopLeft = farPlaneCFrame * Vector3.new(-farPlaneWidth2, farPlaneHeight2, 0)
 	local farPlaneTopRight = farPlaneCFrame * Vector3.new(farPlaneWidth2, farPlaneHeight2, 0)
 	local farPlaneBottomLeft = farPlaneCFrame * Vector3.new(-farPlaneWidth2, -farPlaneHeight2, 0)
 	local farPlaneBottomRight = farPlaneCFrame * Vector3.new(farPlaneWidth2, -farPlaneHeight2, 0)
 
-	local upVec, rightVec, lookVec = cameraCFrame.UpVector, cameraCFrame.RightVector, cameraCFrame.LookVector
+	local upVec, rightVec = cameraCFrame.UpVector, cameraCFrame.RightVector
 
 	local rightNormal = upVec:Cross(cameraPos - farPlaneBottomRight).Unit
 	local leftNormal = upVec:Cross(farPlaneBottomLeft - cameraPos).Unit
 	local topNormal = rightVec:Cross(farPlaneTopRight - cameraPos).Unit
 	local bottomNormal = rightVec:Cross(cameraPos - farPlaneBottomRight).Unit
 
-	local triangleVertices = {
-		{ farPlaneTopLeft, farPlaneBottomLeft, cameraPos, leftNormal, cameraPos }, -- Left
-		{ farPlaneTopRight, cameraPos, farPlaneBottomRight, rightNormal, cameraPos }, -- Right
-		{ farPlaneTopLeft, cameraPos, farPlaneTopRight, topNormal, cameraPos }, -- Top
-		{ farPlaneBottomRight, cameraPos, farPlaneBottomLeft, bottomNormal, cameraPos }, -- Bottom
-		{ farPlaneTopLeft, farPlaneTopRight, farPlaneBottomLeft, lookVec, farPlanePos }, -- Front 1
-		{ farPlaneBottomLeft, farPlaneTopRight, farPlaneBottomRight, lookVec, farPlanePos }, -- Front 2
+	local frustumPlanes: { Vector3 } = {
+		cameraPos,
+		leftNormal,
+		cameraPos,
+		rightNormal,
+		cameraPos,
+		topNormal,
+		cameraPos,
+		bottomNormal,
+		farPlaneCFrame.Position,
+		cameraCFrame.LookVector,
 	}
 
-	local function isVoxelInFrustum(x: number, y: number, z: number): boolean
-		local v0 = Vector3.new(x * voxelSize, y * voxelSize, z * voxelSize)
-		if visibleVoxelKeys[v0] then
-			return true
-		end
+	local minBound = Vector3.new(
+		math.min(cameraPos.X, farPlaneTopLeft.X, farPlaneBottomLeft.X, farPlaneTopRight.X, farPlaneBottomRight.X)
+			// voxelSize,
+		math.min(cameraPos.Y, farPlaneTopLeft.Y, farPlaneBottomLeft.Y, farPlaneTopRight.Y, farPlaneBottomRight.Y)
+			// voxelSize,
+		math.min(cameraPos.Z, farPlaneTopLeft.Z, farPlaneBottomLeft.Z, farPlaneTopRight.Z, farPlaneBottomRight.Z)
+			// voxelSize
+	)
+	local maxBound = Vector3.new(
+		math.max(cameraPos.X, farPlaneTopLeft.X, farPlaneBottomLeft.X, farPlaneTopRight.X, farPlaneBottomRight.X)
+			// voxelSize,
+		math.max(cameraPos.Y, farPlaneTopLeft.Y, farPlaneBottomLeft.Y, farPlaneTopRight.Y, farPlaneBottomRight.Y)
+			// voxelSize,
+		math.max(cameraPos.Z, farPlaneTopLeft.Z, farPlaneBottomLeft.Z, farPlaneTopRight.Z, farPlaneBottomRight.Z)
+			// voxelSize
+	)
 
-		local v7 = Vector3.new((x + 1) * voxelSize, (y + 1) * voxelSize, (z + 1) * voxelSize)
+	return frustumPlanes, minBound, maxBound
+end
 
-		local vertices = {
-			v0,
-			Vector3.new(v0.X, v0.Y, v7.Z),
-			Vector3.new(v0.X, v7.Y, v0.Z),
-			Vector3.new(v0.X, v7.Y, v7.Z),
-			Vector3.new(v7.X, v0.Y, v0.Z),
-			Vector3.new(v7.X, v0.Y, v7.Z),
-			Vector3.new(v7.X, v7.Y, v0.Z),
-			v7,
-		}
+function CullThrottle._getObjects(self: CullThrottle, shouldDistThrottle: boolean): () -> (Instance?, number?)
+	local now = os.clock()
 
-		debug.profilebegin("checkNormals")
-		for _, vertex in vertices do
-			-- Check if point lies outside a frustum plane
-			local camToVoxel = vertex - cameraPos
-			local insideTris = topNormal:Dot(camToVoxel) < -1e-6
-				and leftNormal:Dot(camToVoxel) < -1e-6
-				and rightNormal:Dot(camToVoxel) < -1e-6
-				and bottomNormal:Dot(camToVoxel) < -1e-6
+	-- Make sure our voxels are up to date
+	-- for up to 0.1 ms
+	self:_processObjectRefreshQueue(1e-4)
 
-			if not insideTris then
-				-- Don't bother computing the far plane, we're already outside
-				continue
-			end
+	local voxelSize = self._voxelSize
+	local halfVoxelSizeVec = self._halfVoxelSizeVec
 
-			local farPlaneToVoxel = vertex - farPlanePos
-			if lookVec:Dot(farPlaneToVoxel) < -1e-6 then
-				debug.profileend()
-				return true
-			end
-		end
-		debug.profileend()
-
-		debug.profilebegin("checkDistanceToTris")
-		local center = Vector3.new((x + 0.5) * voxelSize, (y + 0.5) * voxelSize, (z + 0.5) * voxelSize)
-		local shouldCheckEdges = false
-		for _, triangle in triangleVertices do
-			if
-				self:_distToTriangle(triangle[1], triangle[2], triangle[3], triangle[4], triangle[5], center)
-				< voxelSize
-			then
-				shouldCheckEdges = true
-				break
-			end
-		end
-		debug.profileend()
-
-		if not shouldCheckEdges then
-			-- We're too far from all planes to have an edge intersecting
-			return false
-		end
-
-		debug.profilebegin("edgeIntersections")
-		if
-			self:_edgeIntersectsMesh(v0, vertices[2], triangleVertices)
-			or self:_edgeIntersectsMesh(v0, vertices[3], triangleVertices)
-			or self:_edgeIntersectsMesh(v0, vertices[5], triangleVertices)
-			or self:_edgeIntersectsMesh(v7, vertices[4], triangleVertices)
-			or self:_edgeIntersectsMesh(v7, vertices[6], triangleVertices)
-			or self:_edgeIntersectsMesh(v7, vertices[7], triangleVertices)
-			or self:_edgeIntersectsMesh(vertices[2], vertices[6], triangleVertices)
-			or self:_edgeIntersectsMesh(vertices[2], vertices[4], triangleVertices)
-			or self:_edgeIntersectsMesh(vertices[3], vertices[4], triangleVertices)
-			or self:_edgeIntersectsMesh(vertices[5], vertices[6], triangleVertices)
-			or self:_edgeIntersectsMesh(vertices[7], vertices[3], triangleVertices)
-		then
-			debug.profileend()
-			return true
-		end
-		debug.profileend()
-		return false
+	local nearRefreshRate = self._nearRefreshRate
+	local refreshRateRange = self._refreshRateRange
+	local renderDistance = self._renderDistance
+	local renderDistanceSq = self._renderDistanceSq
+	-- For smaller FOVs, we increase render distance
+	if CameraCache.FieldOfView < 60 then
+		renderDistance *= 2 - CameraCache.FieldOfView / 60
+		renderDistanceSq = renderDistance * renderDistance
 	end
 
-	debug.profilebegin("FindVisibleVoxels")
+	local cameraPos = CameraCache.Position
+	local frustumPlanes, minBound, maxBound = self:_getPlanesAndBounds(renderDistance, voxelSize)
 
-	debug.profilebegin("SetCornerVoxels")
-	-- The camera and corners should always be inside
-	self:_addVoxelsAroundVertex(cameraPos // voxelSize + Vector3.one, visibleVoxelKeys)
-	self:_addVoxelsAroundVertex(farPlaneTopLeft // voxelSize + Vector3.one, visibleVoxelKeys)
-	self:_addVoxelsAroundVertex(farPlaneTopRight // voxelSize + Vector3.one, visibleVoxelKeys)
-	self:_addVoxelsAroundVertex(farPlaneBottomLeft // voxelSize + Vector3.one, visibleVoxelKeys)
-	self:_addVoxelsAroundVertex(farPlaneBottomRight // voxelSize + Vector3.one, visibleVoxelKeys)
-	debug.profileend()
+	local minX = minBound.X
+	local minY = minBound.Y
+	local minZ = minBound.Z
+	local maxX = maxBound.X + 1
+	local maxY = maxBound.Y + 1
+	local maxZ = maxBound.Z + 1
 
-	local minX = math.min(
-		cameraPos.X,
-		farPlaneTopLeft.X,
-		farPlaneTopRight.X,
-		farPlaneBottomLeft.X,
-		farPlaneBottomRight.X
-	) // voxelSize
-	local maxX = math.max(
-		cameraPos.X,
-		farPlaneTopLeft.X,
-		farPlaneTopRight.X,
-		farPlaneBottomLeft.X,
-		farPlaneBottomRight.X
-	) // voxelSize
-	local minY = math.min(
-		cameraPos.Y,
-		farPlaneTopLeft.Y,
-		farPlaneTopRight.Y,
-		farPlaneBottomLeft.Y,
-		farPlaneBottomRight.Y
-	) // voxelSize
-	local maxY = math.max(
-		cameraPos.Y,
-		farPlaneTopLeft.Y,
-		farPlaneTopRight.Y,
-		farPlaneBottomLeft.Y,
-		farPlaneBottomRight.Y
-	) // voxelSize
-	local minZ = math.min(
-		cameraPos.Z,
-		farPlaneTopLeft.Z,
-		farPlaneTopRight.Z,
-		farPlaneBottomLeft.Z,
-		farPlaneBottomRight.Z
-	) // voxelSize
-	local maxZ = math.max(
-		cameraPos.Z,
-		farPlaneTopLeft.Z,
-		farPlaneTopRight.Z,
-		farPlaneBottomLeft.Z,
-		farPlaneBottomRight.Z
-	) // voxelSize
-
-	-- Now we need to check all voxels within the min and max bounds
-	debug.profilebegin("BinarySearch")
-	for x = minX, maxX do
-		for y = minY, maxY do
-			for searchZ = minZ, maxZ do
-				-- We are looking for the first visible voxel in this row
-				if not isVoxelInFrustum(x, y, searchZ) then
-					continue
-				end
-
-				-- Now that we have the first visible voxel, we need to find the last visible voxel.
-				-- Because the frustum is convex and contains no holes, we know that
-				-- the remainder of the row is sorted- inside the frustum, then outside.
-				-- This allows us to do a binary search to find the last voxel,
-				-- and then all voxels from here to there are inside the frustum.
-				local entry, exit = searchZ, minZ - 1
-				local left = searchZ
-				local right = maxZ
-
-				while left <= right do
-					local mid = (left + right) // 2
-
-					if isVoxelInFrustum(x, y, mid) then
-						exit = mid
-						left = mid + 1
-					else
-						right = mid - 1
-					end
-				end
-
-				-- Add all the voxels from the entry to the exit
-				for z = entry, exit do
-					self:_addVoxelsAroundVertex(Vector3.new(x, y, z), visibleVoxelKeys)
-					-- visibleVoxelKeys[Vector3.new(x, y, z)] = true
-				end
-
-				-- This row is complete, we don't need to scan further
-				break
-			end
+	local thread = coroutine.create(function()
+		local function callback(voxelKey: Vector3)
+			self:_processVoxel(
+				now,
+				shouldDistThrottle,
+				voxelKey,
+				voxelSize,
+				halfVoxelSizeVec,
+				cameraPos,
+				nearRefreshRate,
+				refreshRateRange,
+				renderDistanceSq
+			)
 		end
+
+		-- Split into smaller boxes to start off since the frustum bounding volume
+		-- obviously intersects the frustum planes
+
+		-- However if the bounds are not divisible then don't split early
+		if minX == maxX or minY == maxY or minZ == maxZ then
+			self:_getFrustumVoxelsInVolume(frustumPlanes, minX, minY, minZ, maxX, maxY, maxZ, callback)
+			return
+		end
+
+		local midBound = (minBound + maxBound) // 2
+		local midX = midBound.X
+		local midY = midBound.Y
+		local midZ = midBound.Z
+
+		self:_getFrustumVoxelsInVolume(frustumPlanes, minX, minY, minZ, midX, midY, midZ, callback)
+		self:_getFrustumVoxelsInVolume(frustumPlanes, midX, minY, minZ, maxX, midY, midZ, callback)
+		self:_getFrustumVoxelsInVolume(frustumPlanes, minX, minY, midZ, midX, midY, maxZ, callback)
+		self:_getFrustumVoxelsInVolume(frustumPlanes, midX, minY, midZ, maxX, midY, maxZ, callback)
+		self:_getFrustumVoxelsInVolume(frustumPlanes, minX, midY, minZ, midX, maxY, midZ, callback)
+		self:_getFrustumVoxelsInVolume(frustumPlanes, midX, midY, minZ, maxX, maxY, midZ, callback)
+		self:_getFrustumVoxelsInVolume(frustumPlanes, minX, midY, midZ, midX, maxY, maxZ, callback)
+		self:_getFrustumVoxelsInVolume(frustumPlanes, midX, midY, midZ, maxX, maxY, maxZ, callback)
+	end)
+
+	return function()
+		if coroutine.status(thread) == "dead" then
+			return
+		end
+
+		local success, object, elapsed = coroutine.resume(thread)
+		if not success then
+			warn("CullThrottle._getObjects thread error: " .. tostring(object))
+			return
+		end
+
+		return object, elapsed
 	end
-	debug.profileend()
-
-	debug.profileend()
-
-	return visibleVoxelKeys
 end
 
 function CullThrottle.setVoxelSize(self: CullThrottle, voxelSize: number)
 	self._voxelSize = voxelSize
+	self._halfVoxelSizeVec = Vector3.one * (voxelSize / 2)
 
 	-- We need to move all the objects around to their new voxels
 	table.clear(self._voxels)
@@ -573,7 +522,6 @@ end
 
 function CullThrottle.setRenderDistance(self: CullThrottle, renderDistance: number)
 	self._renderDistance = renderDistance
-	self._halfRenderDistance = renderDistance / 2
 	self._renderDistanceSq = renderDistance * renderDistance
 end
 
@@ -652,111 +600,12 @@ function CullThrottle.remove(self: CullThrottle, object: Instance)
 	self:_removeFromVoxel(objectData.voxelKey, object)
 end
 
-function CullThrottle.getObjectsToUpdate(self: CullThrottle): () -> (Instance?, number?)
-	local visibleVoxelKeys = self:_getVisibleVoxelKeys()
-
-	local now = os.clock()
-	local cameraPos = CameraCache.Position
-	local voxelSize = self._voxelSize
-	local halfVoxelSizeVector = Vector3.new(voxelSize / 2, voxelSize / 2, voxelSize / 2)
-	local nearRefreshRate = self._nearRefreshRate
-	local refreshRateRange = self._refreshRateRange
-	local renderDistance = self._renderDistance
-	local renderDistanceSq = self._renderDistanceSq
-	if CameraCache.FieldOfView < 70 then
-		renderDistance *= 2 - CameraCache.FieldOfView / 70
-		renderDistanceSq = renderDistance * renderDistance
-	end
-
-	local thread = coroutine.create(function()
-		debug.profilebegin("UpdateObjects")
-		for voxelKey in visibleVoxelKeys do
-			local voxel = self._voxels[voxelKey]
-			if not voxel then
-				continue
-			end
-
-			-- Instead of throttling updates for each object by distance, we approximate by computing the distance
-			-- to the voxel center. This gives us less precise throttling, but saves a ton of compute
-			-- and scales on voxel size instead of object count.
-			local voxelWorldPos = (voxelKey * voxelSize) + halfVoxelSizeVector
-			local dx = cameraPos.X - voxelWorldPos.X
-			local dy = cameraPos.Y - voxelWorldPos.Y
-			local dz = cameraPos.Z - voxelWorldPos.Z
-			local distSq = dx * dx + dy * dy + dz * dz
-			local refreshDelay = nearRefreshRate + (refreshRateRange * math.min(distSq / renderDistanceSq, 1))
-
-			for _, object in voxel do
-				local objectData = self._objects[object]
-				if not objectData then
-					continue
-				end
-
-				-- We add jitter to the timings so we don't end up with
-				-- every object in the voxel updating on the same frame
-				local elapsed = now - objectData.lastUpdateClock
-				local jitter = math.random() / 150
-				if elapsed + jitter <= refreshDelay then
-					-- It is not yet time to update this one
-					continue
-				end
-
-				coroutine.yield(object, elapsed)
-				objectData.lastUpdateClock = now
-			end
-		end
-
-		debug.profileend()
-
-		return
-	end)
-
-	return function()
-		if coroutine.status(thread) == "dead" then
-			return
-		end
-
-		local success, object, lastUpdateClock = coroutine.resume(thread)
-		if not success then
-			warn("CullThrottle.getObjectsToUpdate thread error: " .. tostring(object))
-			return
-		end
-
-		return object, lastUpdateClock
-	end
+function CullThrottle.getObjectsInView(self: CullThrottle): () -> (Instance?, number?)
+	return self:_getObjects(false)
 end
 
-function CullThrottle.getObjectsInView(self: CullThrottle): () -> Instance?
-	local visibleVoxelKeys = self:_getVisibleVoxelKeys()
-
-	local thread = coroutine.create(function()
-		for voxelKey in visibleVoxelKeys do
-			local voxel = self._voxels[voxelKey]
-			if not voxel then
-				continue
-			end
-
-			for _, object in voxel do
-				coroutine.yield(object)
-			end
-		end
-
-		return
-	end)
-
-	return function()
-		if coroutine.status(thread) == "dead" then
-			return
-		end
-
-		local success, object = coroutine.resume(thread)
-		if not success then
-			warn("CullThrottle.getObjectsToUpdate thread error: " .. tostring(object))
-			return
-		end
-
-		return object
-	end
+function CullThrottle.getObjectsToUpdate(self: CullThrottle): () -> (Instance?, number?)
+	return self:_getObjects(true)
 end
 
 return CullThrottle
