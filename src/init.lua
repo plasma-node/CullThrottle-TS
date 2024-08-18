@@ -34,6 +34,7 @@ type CullThrottleProto = {
 		},
 	},
 	_objectRefreshQueue: PriorityQueue.PriorityQueue,
+	_vertexVisibilityCache: { [Vector3]: boolean },
 }
 
 export type CullThrottle = typeof(setmetatable({} :: CullThrottleProto, CullThrottle))
@@ -51,6 +52,7 @@ function CullThrottle.new(): CullThrottle
 	self._voxels = {}
 	self._objects = {}
 	self._objectRefreshQueue = PriorityQueue.new()
+	self._vertexVisibilityCache = {}
 
 	return self
 end
@@ -185,8 +187,10 @@ function CullThrottle._processObjectRefreshQueue(self: CullThrottle, time_limit:
 end
 
 -- Function to check if a box is inside a frustum using SAT
+local verticesToCheck = table.create(8)
 function CullThrottle._isBoxInFrustum(
 	self: CullThrottle,
+	checkForCompletelyInside: boolean,
 	frustumPlanes: { Vector3 },
 	x0: number,
 	y0: number,
@@ -197,18 +201,21 @@ function CullThrottle._isBoxInFrustum(
 ): (boolean, boolean)
 	debug.profilebegin("isBoxInFrustum")
 	local voxelSize = self._voxelSize
+	local vertexVisibilityCache = self._vertexVisibilityCache
 
 	-- Convert the box bounds into the 8 corners of the box in world space
-	local corners = {
-		Vector3.new(x0, y0, z0) * voxelSize,
-		Vector3.new(x1, y0, z0) * voxelSize,
-		Vector3.new(x0, y1, z0) * voxelSize,
-		Vector3.new(x1, y1, z0) * voxelSize,
-		Vector3.new(x0, y0, z1) * voxelSize,
-		Vector3.new(x1, y0, z1) * voxelSize,
-		Vector3.new(x0, y1, z1) * voxelSize,
-		Vector3.new(x1, y1, z1) * voxelSize,
-	}
+	local x0W, x1W = x0 * voxelSize, x1 * voxelSize
+	local y0W, y1W = y0 * voxelSize, y1 * voxelSize
+	local z0W, z1W = z0 * voxelSize, z1 * voxelSize
+	-- Reuse the same table to avoid allocations and cleanup
+	verticesToCheck[1] = Vector3.new(x0W, y0W, z0W)
+	verticesToCheck[2] = Vector3.new(x1W, y0W, z0W)
+	verticesToCheck[3] = Vector3.new(x0W, y1W, z0W)
+	verticesToCheck[4] = Vector3.new(x1W, y1W, z0W)
+	verticesToCheck[5] = Vector3.new(x0W, y0W, z1W)
+	verticesToCheck[6] = Vector3.new(x1W, y0W, z1W)
+	verticesToCheck[7] = Vector3.new(x0W, y1W, z1W)
+	verticesToCheck[8] = Vector3.new(x1W, y1W, z1W)
 
 	local isBoxInside = true
 	local isBoxCompletelyInside = true
@@ -219,12 +226,28 @@ function CullThrottle._isBoxInFrustum(
 		local allCornersInside = true
 
 		-- Check the position of each corner relative to the plane
-		for _, corner in corners do
-			-- Check if corner lies outside the frustum plane
-			local cornerToPlane = corner - pos
-			if normal:Dot(cornerToPlane) <= EPSILON then
-				-- This corner is inside
+		for _, vertex in verticesToCheck do
+			local isVertexInside = false
+			if vertexVisibilityCache[vertex] ~= nil then
+				isVertexInside = vertexVisibilityCache[vertex]
+			else
+				-- Check if corner lies outside the frustum plane
+				if normal:Dot(vertex - pos) <= EPSILON then
+					isVertexInside = true
+					-- This corner is inside
+				else
+					isVertexInside = false
+				end
+				vertexVisibilityCache[vertex] = isVertexInside
+			end
+
+			if isVertexInside then
 				allCornersOutside = false
+				if not checkForCompletelyInside then
+					-- We can early exit on the first inside corner
+					debug.profileend()
+					return true, true
+				end
 			else
 				allCornersInside = false
 			end
@@ -265,9 +288,11 @@ function CullThrottle._processVoxel(
 	end
 
 	if not shouldDistThrottle then
+		debug.profilebegin("usersCode")
 		for _, object in voxel do
 			coroutine.yield(object)
 		end
+		debug.profileend()
 		return
 	end
 
@@ -297,7 +322,7 @@ function CullThrottle._processVoxel(
 			continue
 		end
 
-		debug.profilebegin("userObjectUpdate")
+		debug.profilebegin("usersCode")
 		coroutine.yield(object, elapsed)
 		debug.profileend()
 
@@ -316,14 +341,18 @@ function CullThrottle._getFrustumVoxelsInVolume(
 	z1: number,
 	callback: (Vector3) -> ()
 )
-	local isInside, isCompletelyInside = self:_isBoxInFrustum(frustumPlanes, x0, y0, z0, x1, y1, z1)
+	local isSingleVoxel = x1 - x0 == 1 and y1 - y0 == 1 and z1 - z0 == 1
+
+	local isInside, isCompletelyInside =
+		self:_isBoxInFrustum(isSingleVoxel == false, frustumPlanes, x0, y0, z0, x1, y1, z1)
+
 	-- Exit case: if the box is outside the frustum, don't split further
 	if not isInside then
 		return
 	end
 
 	-- Base case: if the box is a single voxel, it cannot be split further
-	if x1 - x0 == 1 and y1 - y0 == 1 and z1 - z0 == 1 then
+	if isSingleVoxel then
 		callback(Vector3.new(x0, y0, z0))
 		return
 	end
@@ -338,6 +367,24 @@ function CullThrottle._getFrustumVoxelsInVolume(
 				end
 			end
 		end
+		return
+	end
+
+	-- Possible exit case: don't bother splitting further if this box doesn't contain any voxels
+	debug.profilebegin("doesBoundsContainVoxels")
+	local containsVoxels = false
+	for x = x0, x1 - 1 do
+		for y = y0, y1 - 1 do
+			for z = z0, z1 - 1 do
+				if self._voxels[Vector3.new(x, y, z)] then
+					containsVoxels = true
+					break
+				end
+			end
+		end
+	end
+	debug.profileend()
+	if not containsVoxels then
 		return
 	end
 
@@ -420,6 +467,8 @@ end
 
 function CullThrottle._getObjects(self: CullThrottle, shouldDistThrottle: boolean): () -> (Instance?, number?)
 	local now = os.clock()
+
+	table.clear(self._vertexVisibilityCache)
 
 	-- Make sure our voxels are up to date
 	-- for up to 0.1 ms

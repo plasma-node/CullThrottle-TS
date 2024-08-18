@@ -46,18 +46,25 @@ CollectionService:GetInstanceRemovedSignal("FloatingBlock"):Connect(function(blo
 	FloatingBlocksUpdater:remove(block)
 end)
 
+local VISIBLE_COLOR = Color3.new(1, 1, 1)
+local HIDDEN_COLOR = Color3.new(0, 0, 0)
+
 local lastVisible = {}
 RunService.RenderStepped:Connect(function()
 	local newVisible = {}
 	for block in FloatingBlocksUpdater:getObjectsInView() do
 		newVisible[block] = true
-		block.Color = Color3.new(1, 1, 1)
+		if block.Color ~= VISIBLE_COLOR then
+			block.Color = VISIBLE_COLOR
+		end
 	end
 
 	-- Get the objects that were visible last frame but not this frame
 	for block in lastVisible do
 		if not newVisible[block] then
-			block.Color = Color3.new(0, 0, 0)
+			if block.Color ~= HIDDEN_COLOR then
+				block.Color = HIDDEN_COLOR
+			end
 		end
 	end
 
