@@ -42,7 +42,7 @@ export type CullThrottle = typeof(setmetatable({} :: CullThrottleProto, CullThro
 function CullThrottle.new(): CullThrottle
 	local self = setmetatable({}, CullThrottle)
 
-	self._voxelSize = 90
+	self._voxelSize = 75
 	self._halfVoxelSizeVec = Vector3.one * (self._voxelSize / 2)
 	self._farRefreshRate = 1 / 15
 	self._nearRefreshRate = 1 / 45
