@@ -342,6 +342,10 @@ function CullThrottle._getFrustumVoxelsInVolume(
 	callback: (Vector3) -> ()
 )
 	local isSingleVoxel = x1 - x0 == 1 and y1 - y0 == 1 and z1 - z0 == 1
+	if isSingleVoxel and not self._voxels[Vector3.new(x0, y0, z0)] then
+		-- Exit case: No need to check an empty voxel
+		return
+	end
 
 	local isInside, isCompletelyInside =
 		self:_isBoxInFrustum(isSingleVoxel == false, frustumPlanes, x0, y0, z0, x1, y1, z1)
