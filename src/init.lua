@@ -11,6 +11,7 @@ local PriorityQueue = require(script.PriorityQueue)
 local CameraCache = require(script.CameraCache)
 
 local EPSILON = 1e-4
+local LAST_VISIBILITY_GRACE_PERIOD = 0.15
 
 local CullThrottle = {}
 CullThrottle.__index = CullThrottle
@@ -20,7 +21,6 @@ type CullThrottleProto = {
 	_nearRefreshRate: number,
 	_refreshRateRange: number,
 	_renderDistance: number,
-	_renderDistanceSq: number,
 	_voxelSize: number,
 	_halfVoxelSizeVec: Vector3,
 	_voxels: { [Vector3]: { Instance } },
@@ -35,6 +35,7 @@ type CullThrottleProto = {
 	},
 	_objectRefreshQueue: PriorityQueue.PriorityQueue,
 	_vertexVisibilityCache: { [Vector3]: boolean },
+	_lastVoxelVisibility: { [Vector3]: number },
 }
 
 export type CullThrottle = typeof(setmetatable({} :: CullThrottleProto, CullThrottle))
@@ -48,11 +49,11 @@ function CullThrottle.new(): CullThrottle
 	self._nearRefreshRate = 1 / 45
 	self._refreshRateRange = self._farRefreshRate - self._nearRefreshRate
 	self._renderDistance = 450
-	self._renderDistanceSq = self._renderDistance * self._renderDistance
 	self._voxels = {}
 	self._objects = {}
 	self._objectRefreshQueue = PriorityQueue.new()
 	self._vertexVisibilityCache = {}
+	self._lastVoxelVisibility = {}
 
 	return self
 end
@@ -274,17 +275,22 @@ function CullThrottle._processVoxel(
 	self: CullThrottle,
 	now: number,
 	shouldDistThrottle: boolean,
+	updateLastVoxelVisiblity: boolean,
 	voxelKey: Vector3,
 	voxelSize: number,
 	halfVoxelSizeVec: Vector3,
 	cameraPos: Vector3,
 	nearRefreshRate: number,
 	refreshRateRange: number,
-	renderDistanceSq: number
+	renderDistance: number
 )
 	local voxel = self._voxels[voxelKey]
 	if not voxel then
 		return
+	end
+
+	if updateLastVoxelVisiblity then
+		self._lastVoxelVisibility[voxelKey] = now
 	end
 
 	if not shouldDistThrottle then
@@ -300,13 +306,9 @@ function CullThrottle._processVoxel(
 	-- to the voxel center. This gives us less precise throttling, but saves a ton of compute
 	-- and scales on voxel size instead of object count.
 	local voxelWorldPos = voxelKey * voxelSize + halfVoxelSizeVec
-	local voxelDistanceSq = (
-		(voxelWorldPos.X - cameraPos.X) ^ 2
-		+ (voxelWorldPos.Y - cameraPos.Y) ^ 2
-		+ (voxelWorldPos.Z - cameraPos.Z) ^ 2
-	)
+	local voxelDistance = (voxelWorldPos - cameraPos).Magnitude
 
-	local refreshDelay = nearRefreshRate + (refreshRateRange * math.min(voxelDistanceSq / renderDistanceSq, 1))
+	local refreshDelay = nearRefreshRate + (refreshRateRange * math.min(voxelDistance / renderDistance, 1))
 	for _, object in voxel do
 		local objectData = self._objects[object]
 		if not objectData then
@@ -332,6 +334,7 @@ end
 
 function CullThrottle._getFrustumVoxelsInVolume(
 	self: CullThrottle,
+	now: number,
 	frustumPlanes: { Vector3 },
 	x0: number,
 	y0: number,
@@ -339,58 +342,85 @@ function CullThrottle._getFrustumVoxelsInVolume(
 	x1: number,
 	y1: number,
 	z1: number,
-	callback: (Vector3) -> ()
+	callback: (Vector3, boolean) -> ()
 )
 	local isSingleVoxel = x1 - x0 == 1 and y1 - y0 == 1 and z1 - z0 == 1
+
+	-- No need to check an empty voxel
 	if isSingleVoxel and not self._voxels[Vector3.new(x0, y0, z0)] then
-		-- Exit case: No need to check an empty voxel
 		return
 	end
 
-	local isInside, isCompletelyInside =
-		self:_isBoxInFrustum(isSingleVoxel == false, frustumPlanes, x0, y0, z0, x1, y1, z1)
-
-	-- Exit case: if the box is outside the frustum, don't split further
-	if not isInside then
-		return
-	end
-
-	-- Base case: if the box is a single voxel, it cannot be split further
-	if isSingleVoxel then
-		callback(Vector3.new(x0, y0, z0))
-		return
-	end
-
-	-- Lucky case: if the box is entirely inside, then we know all voxels contained inside are in the frustum
-	-- and we can process them now and not split further
-	if isCompletelyInside then
-		for x = x0, x1 - 1 do
-			for y = y0, y1 - 1 do
-				for z = z0, z1 - 1 do
-					callback(Vector3.new(x, y, z))
-				end
-			end
-		end
-		return
-	end
-
-	-- Possible exit case: don't bother splitting further if this box doesn't contain any voxels
-	debug.profilebegin("doesBoundsContainVoxels")
+	debug.profilebegin("checkBoxVisibilityCache")
+	local allVoxelsVisible = true
 	local containsVoxels = false
 	for x = x0, x1 - 1 do
 		for y = y0, y1 - 1 do
 			for z = z0, z1 - 1 do
-				if self._voxels[Vector3.new(x, y, z)] then
+				local voxelKey = Vector3.new(x, y, z)
+				if self._voxels[voxelKey] then
 					containsVoxels = true
-					break
+					if now - (self._lastVoxelVisibility[voxelKey] or 0) >= LAST_VISIBILITY_GRACE_PERIOD then
+						allVoxelsVisible = false
+						break
+					end
 				end
 			end
 		end
 	end
 	debug.profileend()
+
+	-- Don't bother checking further if this box doesn't contain any voxels
 	if not containsVoxels then
 		return
 	end
+
+	-- If all voxels in this box were visible a moment ago, just assume they still are
+	if allVoxelsVisible then
+		for x = x0, x1 - 1 do
+			for y = y0, y1 - 1 do
+				for z = z0, z1 - 1 do
+					callback(Vector3.new(x, y, z), false)
+				end
+			end
+		end
+		return
+	end
+
+	-- Alright, we actually do need to check if this box is visible
+	local isInside, isCompletelyInside =
+		self:_isBoxInFrustum(isSingleVoxel == false, frustumPlanes, x0, y0, z0, x1, y1, z1)
+
+	-- If the box is outside the frustum, stop checking now
+	if not isInside then
+		if isSingleVoxel then
+			-- Remove voxel visibility
+			self._lastVoxelVisibility[Vector3.new(x0, y0, z0)] = nil
+		end
+		return
+	end
+
+	-- If the box is a single voxel, it cannot be split further
+	if isSingleVoxel then
+		callback(Vector3.new(x0, y0, z0), true)
+		return
+	end
+
+	-- If the box is entirely inside, then we know all voxels contained inside are in the frustum
+	-- and we can process them now and not split further
+	if isCompletelyInside then
+		for x = x0, x1 - 1 do
+			for y = y0, y1 - 1 do
+				for z = z0, z1 - 1 do
+					callback(Vector3.new(x, y, z), true)
+				end
+			end
+		end
+		return
+	end
+
+	-- We are partially inside, so we need to split this box up further
+	-- to figure out which voxels within it are the ones inside
 
 	-- Calculate the lengths of each axis
 	local lengthX = x1 - x0
@@ -400,16 +430,16 @@ function CullThrottle._getFrustumVoxelsInVolume(
 	-- Split along the axis with the greatest length
 	if lengthX >= lengthY and lengthX >= lengthZ then
 		local splitCoord = (x0 + x1) // 2
-		self:_getFrustumVoxelsInVolume(frustumPlanes, x0, y0, z0, splitCoord, y1, z1, callback)
-		self:_getFrustumVoxelsInVolume(frustumPlanes, splitCoord, y0, z0, x1, y1, z1, callback)
+		self:_getFrustumVoxelsInVolume(now, frustumPlanes, x0, y0, z0, splitCoord, y1, z1, callback)
+		self:_getFrustumVoxelsInVolume(now, frustumPlanes, splitCoord, y0, z0, x1, y1, z1, callback)
 	elseif lengthY >= lengthX and lengthY >= lengthZ then
 		local splitCoord = (y0 + y1) // 2
-		self:_getFrustumVoxelsInVolume(frustumPlanes, x0, y0, z0, x1, splitCoord, z1, callback)
-		self:_getFrustumVoxelsInVolume(frustumPlanes, x0, splitCoord, z0, x1, y1, z1, callback)
+		self:_getFrustumVoxelsInVolume(now, frustumPlanes, x0, y0, z0, x1, splitCoord, z1, callback)
+		self:_getFrustumVoxelsInVolume(now, frustumPlanes, x0, splitCoord, z0, x1, y1, z1, callback)
 	else
 		local splitCoord = (z0 + z1) // 2
-		self:_getFrustumVoxelsInVolume(frustumPlanes, x0, y0, z0, x1, y1, splitCoord, callback)
-		self:_getFrustumVoxelsInVolume(frustumPlanes, x0, y0, splitCoord, x1, y1, z1, callback)
+		self:_getFrustumVoxelsInVolume(now, frustumPlanes, x0, y0, z0, x1, y1, splitCoord, callback)
+		self:_getFrustumVoxelsInVolume(now, frustumPlanes, x0, y0, splitCoord, x1, y1, z1, callback)
 	end
 end
 
@@ -484,11 +514,9 @@ function CullThrottle._getObjects(self: CullThrottle, shouldDistThrottle: boolea
 	local nearRefreshRate = self._nearRefreshRate
 	local refreshRateRange = self._refreshRateRange
 	local renderDistance = self._renderDistance
-	local renderDistanceSq = self._renderDistanceSq
 	-- For smaller FOVs, we increase render distance
 	if CameraCache.FieldOfView < 60 then
 		renderDistance *= 2 - CameraCache.FieldOfView / 60
-		renderDistanceSq = renderDistance * renderDistance
 	end
 
 	local cameraPos = CameraCache.Position
@@ -502,17 +530,18 @@ function CullThrottle._getObjects(self: CullThrottle, shouldDistThrottle: boolea
 	local maxZ = maxBound.Z + 1
 
 	local thread = coroutine.create(function()
-		local function callback(voxelKey: Vector3)
+		local function callback(voxelKey: Vector3, updateLastVoxelVisiblity: boolean)
 			self:_processVoxel(
 				now,
 				shouldDistThrottle,
+				updateLastVoxelVisiblity,
 				voxelKey,
 				voxelSize,
 				halfVoxelSizeVec,
 				cameraPos,
 				nearRefreshRate,
 				refreshRateRange,
-				renderDistanceSq
+				renderDistance
 			)
 		end
 
@@ -521,7 +550,7 @@ function CullThrottle._getObjects(self: CullThrottle, shouldDistThrottle: boolea
 
 		-- However if the bounds are not divisible then don't split early
 		if minX == maxX or minY == maxY or minZ == maxZ then
-			self:_getFrustumVoxelsInVolume(frustumPlanes, minX, minY, minZ, maxX, maxY, maxZ, callback)
+			self:_getFrustumVoxelsInVolume(now, frustumPlanes, minX, minY, minZ, maxX, maxY, maxZ, callback)
 			return
 		end
 
@@ -530,14 +559,14 @@ function CullThrottle._getObjects(self: CullThrottle, shouldDistThrottle: boolea
 		local midY = midBound.Y
 		local midZ = midBound.Z
 
-		self:_getFrustumVoxelsInVolume(frustumPlanes, minX, minY, minZ, midX, midY, midZ, callback)
-		self:_getFrustumVoxelsInVolume(frustumPlanes, midX, minY, minZ, maxX, midY, midZ, callback)
-		self:_getFrustumVoxelsInVolume(frustumPlanes, minX, minY, midZ, midX, midY, maxZ, callback)
-		self:_getFrustumVoxelsInVolume(frustumPlanes, midX, minY, midZ, maxX, midY, maxZ, callback)
-		self:_getFrustumVoxelsInVolume(frustumPlanes, minX, midY, minZ, midX, maxY, midZ, callback)
-		self:_getFrustumVoxelsInVolume(frustumPlanes, midX, midY, minZ, maxX, maxY, midZ, callback)
-		self:_getFrustumVoxelsInVolume(frustumPlanes, minX, midY, midZ, midX, maxY, maxZ, callback)
-		self:_getFrustumVoxelsInVolume(frustumPlanes, midX, midY, midZ, maxX, maxY, maxZ, callback)
+		self:_getFrustumVoxelsInVolume(now, frustumPlanes, minX, minY, minZ, midX, midY, midZ, callback)
+		self:_getFrustumVoxelsInVolume(now, frustumPlanes, midX, minY, minZ, maxX, midY, midZ, callback)
+		self:_getFrustumVoxelsInVolume(now, frustumPlanes, minX, minY, midZ, midX, midY, maxZ, callback)
+		self:_getFrustumVoxelsInVolume(now, frustumPlanes, midX, minY, midZ, maxX, midY, maxZ, callback)
+		self:_getFrustumVoxelsInVolume(now, frustumPlanes, minX, midY, minZ, midX, maxY, midZ, callback)
+		self:_getFrustumVoxelsInVolume(now, frustumPlanes, midX, midY, minZ, maxX, maxY, midZ, callback)
+		self:_getFrustumVoxelsInVolume(now, frustumPlanes, minX, midY, midZ, midX, maxY, maxZ, callback)
+		self:_getFrustumVoxelsInVolume(now, frustumPlanes, midX, midY, midZ, maxX, maxY, maxZ, callback)
 	end)
 
 	return function()
@@ -575,14 +604,13 @@ end
 
 function CullThrottle.setRenderDistance(self: CullThrottle, renderDistance: number)
 	self._renderDistance = renderDistance
-	self._renderDistanceSq = renderDistance * renderDistance
 end
 
 function CullThrottle.setRefreshRates(self: CullThrottle, near: number, far: number)
-	if near > 1 then
+	if near > 2 then
 		near = 1 / near
 	end
-	if far > 1 then
+	if far > 2 then
 		far = 1 / far
 	end
 
