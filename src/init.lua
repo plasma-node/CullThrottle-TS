@@ -346,11 +346,13 @@ function CullThrottle._processVoxel(
 			continue
 		end
 
+		debug.profilebegin("sizeThrottle")
 		local screenSize = self:_getScreenSize(voxelDistance, objectData.radius)
 		local sizeRatio = (screenSize - MIN_SCREEN_SIZE) / SCREEN_SIZE_RANGE
 		local refreshDelay = bestRefreshRate + (refreshRateRange * (1 - sizeRatio))
-
 		local elapsed = now - objectData.lastUpdateClock
+		debug.profileend()
+
 		if elapsed <= refreshDelay then
 			-- It is not yet time to update this one
 			continue
