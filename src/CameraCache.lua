@@ -11,6 +11,7 @@ export type CameraCache = {
 	Position: Vector3,
 	FieldOfView: number,
 	HalfTanFOV: number,
+	DoubleTanFOV: number,
 	ViewportSize: Vector2,
 	AspectRatio: number,
 }
@@ -21,6 +22,7 @@ local CameraCache: CameraCache = {
 	Position = workspace.CurrentCamera.CFrame.Position,
 	FieldOfView = workspace.CurrentCamera.FieldOfView,
 	HalfTanFOV = math.tan(math.rad(workspace.CurrentCamera.FieldOfView / 2)),
+	DoubleTanFOV = 2 * math.tan(math.rad(workspace.CurrentCamera.FieldOfView / 2)),
 	ViewportSize = workspace.CurrentCamera.ViewportSize,
 	AspectRatio = workspace.CurrentCamera.ViewportSize.X / workspace.CurrentCamera.ViewportSize.Y,
 }
@@ -40,6 +42,7 @@ local function initCamera(camera: Camera)
 	CameraCache.Position = CameraCache.CFrame.Position
 	CameraCache.AspectRatio = CameraCache.ViewportSize.X / CameraCache.ViewportSize.Y
 	CameraCache.HalfTanFOV = math.tan(math.rad(CameraCache.FieldOfView / 2))
+	CameraCache.DoubleTanFOV = 2 * CameraCache.HalfTanFOV
 
 	cameraConnections.CFrameChanged = CameraCache.Object:GetPropertyChangedSignal("CFrame"):Connect(function()
 		CameraCache.CFrame = CameraCache.Object.CFrame
@@ -48,6 +51,7 @@ local function initCamera(camera: Camera)
 	cameraConnections.FieldOfViewChanged = CameraCache.Object:GetPropertyChangedSignal("FieldOfView"):Connect(function()
 		CameraCache.FieldOfView = CameraCache.Object.FieldOfView
 		CameraCache.HalfTanFOV = math.tan(math.rad(CameraCache.FieldOfView / 2))
+		CameraCache.DoubleTanFOV = 2 * CameraCache.HalfTanFOV
 	end)
 	cameraConnections.ViewportSizeChanged = CameraCache.Object
 		:GetPropertyChangedSignal("ViewportSize")

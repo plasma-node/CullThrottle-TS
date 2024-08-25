@@ -12,13 +12,16 @@ local CameraCache = require(script.CameraCache)
 
 local EPSILON = 1e-4
 local LAST_VISIBILITY_GRACE_PERIOD = 0.15
+local MIN_SCREEN_SIZE = 1 / 100
+local MAX_SCREEN_SIZE = 8 / 100
+local SCREEN_SIZE_RANGE = MAX_SCREEN_SIZE - MIN_SCREEN_SIZE
 
 local CullThrottle = {}
 CullThrottle.__index = CullThrottle
 
 type CullThrottleProto = {
-	_farRefreshRate: number,
-	_nearRefreshRate: number,
+	_bestRefreshRate: number,
+	_worstRefreshRate: number,
 	_refreshRateRange: number,
 	_renderDistance: number,
 	_voxelSize: number,
@@ -31,6 +34,8 @@ type CullThrottleProto = {
 			desiredVoxelKey: Vector3?,
 			position: Vector3,
 			positionChangeConnection: RBXScriptConnection?,
+			radius: number,
+			radiusChangeConnection: RBXScriptConnection?,
 		},
 	},
 	_objectRefreshQueue: PriorityQueue.PriorityQueue,
@@ -45,9 +50,9 @@ function CullThrottle.new(): CullThrottle
 
 	self._voxelSize = 75
 	self._halfVoxelSizeVec = Vector3.one * (self._voxelSize / 2)
-	self._farRefreshRate = 1 / 15
-	self._nearRefreshRate = 1 / 45
-	self._refreshRateRange = self._farRefreshRate - self._nearRefreshRate
+	self._bestRefreshRate = 1 / 45
+	self._worstRefreshRate = 1 / 15
+	self._refreshRateRange = self._worstRefreshRate - self._bestRefreshRate
 	self._renderDistance = 450
 	self._voxels = {}
 	self._objects = {}
@@ -127,6 +132,27 @@ function CullThrottle._getPositionOfObject(
 	end
 
 	return parentPosition, parentChangeConnection
+end
+
+function CullThrottle._getRadiusOfObject(
+	_self: CullThrottle,
+	object: Instance,
+	onChanged: (() -> ())?
+): (number, RBXScriptConnection?)
+	local size = Vector3.one
+	local changeConnection = nil
+
+	if object:IsA("BasePart") then
+		size = object.Size
+		if onChanged then
+			changeConnection = object:GetPropertyChangedSignal("Size"):Connect(onChanged)
+		end
+	elseif object:IsA("Model") then
+		size = object:GetExtentsSize()
+	end
+
+	-- Calculate the bounding sphere radius
+	return math.max(size.X, size.Y, size.Z) / 2, changeConnection
 end
 
 function CullThrottle._insertToVoxel(self: CullThrottle, voxelKey: Vector3, object: Instance)
@@ -271,18 +297,24 @@ function CullThrottle._isBoxInFrustum(
 	return isBoxInside, isBoxCompletelyInside
 end
 
+function CullThrottle._getScreenSize(_self: CullThrottle, distance: number, radius: number): number
+	-- Calculate the screen size using the precomputed tan(FoV/2) * 2
+	local screenSize = (radius / distance) * CameraCache.DoubleTanFOV
+
+	return math.clamp(screenSize, MIN_SCREEN_SIZE, MAX_SCREEN_SIZE)
+end
+
 function CullThrottle._processVoxel(
 	self: CullThrottle,
 	now: number,
-	shouldDistThrottle: boolean,
+	shouldSizeThrottle: boolean,
 	updateLastVoxelVisiblity: boolean,
 	voxelKey: Vector3,
 	voxelSize: number,
 	halfVoxelSizeVec: Vector3,
 	cameraPos: Vector3,
-	nearRefreshRate: number,
-	refreshRateRange: number,
-	renderDistance: number
+	bestRefreshRate: number,
+	refreshRateRange: number
 )
 	local voxel = self._voxels[voxelKey]
 	if not voxel then
@@ -293,7 +325,7 @@ function CullThrottle._processVoxel(
 		self._lastVoxelVisibility[voxelKey] = now
 	end
 
-	if not shouldDistThrottle then
+	if not shouldSizeThrottle then
 		debug.profilebegin("usersCode")
 		for _, object in voxel do
 			coroutine.yield(object)
@@ -308,18 +340,18 @@ function CullThrottle._processVoxel(
 	local voxelWorldPos = voxelKey * voxelSize + halfVoxelSizeVec
 	local voxelDistance = (voxelWorldPos - cameraPos).Magnitude
 
-	local refreshDelay = nearRefreshRate + (refreshRateRange * math.min(voxelDistance / renderDistance, 1))
 	for _, object in voxel do
 		local objectData = self._objects[object]
 		if not objectData then
 			continue
 		end
 
-		-- We add jitter to the timings so we don't end up with
-		-- spikes of every object in the voxel updating on the same frame
+		local screenSize = self:_getScreenSize(voxelDistance, objectData.radius)
+		local sizeRatio = (screenSize - MIN_SCREEN_SIZE) / SCREEN_SIZE_RANGE
+		local refreshDelay = bestRefreshRate + (refreshRateRange * (1 - sizeRatio))
+
 		local elapsed = now - objectData.lastUpdateClock
-		local jitter = math.random() / 150
-		if elapsed + jitter <= refreshDelay then
+		if elapsed <= refreshDelay then
 			-- It is not yet time to update this one
 			continue
 		end
@@ -499,7 +531,7 @@ function CullThrottle._getPlanesAndBounds(
 	return frustumPlanes, minBound, maxBound
 end
 
-function CullThrottle._getObjects(self: CullThrottle, shouldDistThrottle: boolean): () -> (Instance?, number?)
+function CullThrottle._getObjects(self: CullThrottle, shouldSizeThrottle: boolean): () -> (Instance?, number?)
 	local now = os.clock()
 
 	table.clear(self._vertexVisibilityCache)
@@ -511,7 +543,7 @@ function CullThrottle._getObjects(self: CullThrottle, shouldDistThrottle: boolea
 	local voxelSize = self._voxelSize
 	local halfVoxelSizeVec = self._halfVoxelSizeVec
 
-	local nearRefreshRate = self._nearRefreshRate
+	local bestRefreshRate = self._bestRefreshRate
 	local refreshRateRange = self._refreshRateRange
 	local renderDistance = self._renderDistance
 	-- For smaller FOVs, we increase render distance
@@ -533,15 +565,14 @@ function CullThrottle._getObjects(self: CullThrottle, shouldDistThrottle: boolea
 		local function callback(voxelKey: Vector3, updateLastVoxelVisiblity: boolean)
 			self:_processVoxel(
 				now,
-				shouldDistThrottle,
+				shouldSizeThrottle,
 				updateLastVoxelVisiblity,
 				voxelKey,
 				voxelSize,
 				halfVoxelSizeVec,
 				cameraPos,
-				nearRefreshRate,
-				refreshRateRange,
-				renderDistance
+				bestRefreshRate,
+				refreshRateRange
 			)
 		end
 
@@ -606,17 +637,17 @@ function CullThrottle.setRenderDistance(self: CullThrottle, renderDistance: numb
 	self._renderDistance = renderDistance
 end
 
-function CullThrottle.setRefreshRates(self: CullThrottle, near: number, far: number)
-	if near > 2 then
-		near = 1 / near
+function CullThrottle.setRefreshRates(self: CullThrottle, best: number, worst: number)
+	if best > 2 then
+		best = 1 / best
 	end
-	if far > 2 then
-		far = 1 / far
+	if worst > 2 then
+		worst = 1 / worst
 	end
 
-	self._nearRefreshRate = near
-	self._farRefreshRate = far
-	self._refreshRateRange = far - near
+	self._bestRefreshRate = best
+	self._worstRefreshRate = worst
+	self._refreshRateRange = worst - best
 end
 
 function CullThrottle.add(self: CullThrottle, object: Instance)
@@ -657,11 +688,27 @@ function CullThrottle.add(self: CullThrottle, object: Instance)
 		error("Cannot add " .. object:GetFullName() .. " to CullThrottle, position is unknown")
 	end
 
+	local radius, radiusChangeConnection = self:_getRadiusOfObject(object, function()
+		local objectData = self._objects[object]
+		if not objectData then
+			return
+		end
+
+		local newRadius = self:_getRadiusOfObject(object)
+		if not newRadius then
+			return
+		end
+
+		objectData.radius = newRadius
+	end)
+
 	local objectData = {
 		lastUpdateClock = os.clock(),
 		voxelKey = position // self._voxelSize,
 		position = position,
 		positionChangeConnection = positionChangeConnection,
+		radius = radius,
+		radiusChangeConnection = radiusChangeConnection,
 	}
 
 	self._objects[object] = objectData
