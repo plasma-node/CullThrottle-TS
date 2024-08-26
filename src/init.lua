@@ -9,6 +9,7 @@ end
 
 local PriorityQueue = require(script.PriorityQueue)
 local CameraCache = require(script.CameraCache)
+local Utility = require(script.Utility)
 
 local EPSILON = 1e-4
 local LAST_VISIBILITY_GRACE_PERIOD = 0.15
@@ -32,6 +33,7 @@ type ObjectData = {
 }
 
 type CullThrottleProto = {
+	DEBUG_MODE: boolean,
 	_bestRefreshRate: number,
 	_worstRefreshRate: number,
 	_refreshRateRange: number,
@@ -52,6 +54,8 @@ export type CullThrottle = typeof(setmetatable({} :: CullThrottleProto, CullThro
 
 function CullThrottle.new(): CullThrottle
 	local self = setmetatable({}, CullThrottle)
+
+	self.DEBUG_MODE = false
 
 	self._voxelSize = 75
 	self._halfVoxelSizeVec = Vector3.one * (self._voxelSize / 2)
@@ -567,7 +571,7 @@ end
 
 function CullThrottle._getScreenSize(_self: CullThrottle, distance: number, radius: number): number
 	-- Calculate the screen size using the precomputed tan(FoV/2) * 2
-	local screenSize = (radius / distance) * CameraCache.DoubleTanFOV
+	local screenSize = (radius / distance) / CameraCache.DoubleTanFOV
 
 	return math.clamp(screenSize, MIN_SCREEN_SIZE, MAX_SCREEN_SIZE)
 end
@@ -579,8 +583,6 @@ function CullThrottle._processVoxel(
 	updateLastVoxelVisiblity: boolean,
 	voxelKey: Vector3,
 	voxel: { Instance },
-	voxelSize: number,
-	halfVoxelSizeVec: Vector3,
 	cameraPos: Vector3,
 	bestRefreshRate: number,
 	refreshRateRange: number
@@ -611,12 +613,6 @@ function CullThrottle._processVoxel(
 		return
 	end
 
-	-- Instead of distance per object, we approximate by computing the distance
-	-- to the voxel center. This gives us less precise throttling, but saves a ton of compute
-	-- and scales on voxel size instead of object count.
-	local voxelWorldPos = voxelKey * voxelSize + halfVoxelSizeVec
-	local voxelDistance = (voxelWorldPos - cameraPos).Magnitude
-
 	for _, object in voxel do
 		local objectData = self._objects[object]
 		if not objectData then
@@ -630,11 +626,15 @@ function CullThrottle._processVoxel(
 		objectData.lastCheckClock = now
 
 		debug.profilebegin("sizeThrottle")
-		local screenSize = self:_getScreenSize(voxelDistance, objectData.radius)
+		local screenSize = self:_getScreenSize((objectData.cframe.Position - cameraPos).Magnitude, objectData.radius)
 		local sizeRatio = (screenSize - MIN_SCREEN_SIZE) / SCREEN_SIZE_RANGE
 		local refreshDelay = bestRefreshRate + (refreshRateRange * (1 - sizeRatio))
 		local elapsed = now - objectData.lastUpdateClock + objectData.jitterOffset
 		debug.profileend()
+
+		if self.DEBUG_MODE then
+			Utility.applyHeatmapColor(object, sizeRatio)
+		end
 
 		if elapsed <= refreshDelay then
 			-- It is not yet time to update this one
@@ -883,8 +883,6 @@ function CullThrottle._getObjects(self: CullThrottle, shouldSizeThrottle: boolea
 				updateLastVoxelVisiblity,
 				voxelKey,
 				voxel,
-				voxelSize,
-				halfVoxelSizeVec,
 				cameraPos,
 				bestRefreshRate,
 				refreshRateRange
