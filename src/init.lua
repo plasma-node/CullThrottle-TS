@@ -371,16 +371,12 @@ function CullThrottle._updateDesiredVoxelKeys(
 	local cframe, halfBoundingBox = objectData.cframe, objectData.halfBoundingBox
 	local position = cframe.Position
 
-	local vertices = nil
-	if objectData.radius < radiusThresholdForCorners then
-		-- Object is small enough that we can assume te center point is enough
-		vertices = { position }
-	else
-		vertices = {
-			-- Center of the object
-			position,
+	local desiredVoxelKey = position // voxelSize
+	desiredVoxelKeys[desiredVoxelKey] = true
 
-			-- Corners of the bounding box (8 vertices)
+	if objectData.radius > radiusThresholdForCorners then
+		-- Object is large enough that we need to consider the corners as well
+		local corners = {
 			(cframe * CFrame.new(halfBoundingBox.X, halfBoundingBox.Y, halfBoundingBox.Z)).Position,
 			(cframe * CFrame.new(-halfBoundingBox.X, -halfBoundingBox.Y, -halfBoundingBox.Z)).Position,
 			(cframe * CFrame.new(-halfBoundingBox.X, halfBoundingBox.Y, halfBoundingBox.Z)).Position,
@@ -390,11 +386,11 @@ function CullThrottle._updateDesiredVoxelKeys(
 			(cframe * CFrame.new(halfBoundingBox.X, -halfBoundingBox.Y, -halfBoundingBox.Z)).Position,
 			(cframe * CFrame.new(halfBoundingBox.X, -halfBoundingBox.Y, halfBoundingBox.Z)).Position,
 		}
-	end
 
-	for _, vertex in vertices do
-		local voxelKey = vertex // voxelSize
-		desiredVoxelKeys[voxelKey] = true
+		for _, corner in corners do
+			local voxelKey = corner // voxelSize
+			desiredVoxelKeys[voxelKey] = true
+		end
 	end
 
 	for voxelKey in objectData.voxelKeys do
