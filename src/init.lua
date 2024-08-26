@@ -20,13 +20,14 @@ local CullThrottle = {}
 CullThrottle.__index = CullThrottle
 
 type ObjectData = {
-	lastCheckClock: number,
-	lastUpdateClock: number,
-	voxelKeys: { [Vector3]: true },
-	desiredVoxelKeys: { [Vector3]: boolean },
 	cframe: CFrame,
 	halfBoundingBox: Vector3,
 	radius: number,
+	voxelKeys: { [Vector3]: true },
+	desiredVoxelKeys: { [Vector3]: boolean },
+	lastCheckClock: number,
+	lastUpdateClock: number,
+	jitterOffset: number,
 	changeConnections: { RBXScriptConnection },
 }
 
@@ -37,6 +38,7 @@ type CullThrottleProto = {
 	_renderDistance: number,
 	_voxelSize: number,
 	_halfVoxelSizeVec: Vector3,
+	_radiusThresholdForCorners: number,
 	_voxels: { [Vector3]: { Instance } },
 	_objects: {
 		[Instance]: ObjectData,
@@ -53,6 +55,7 @@ function CullThrottle.new(): CullThrottle
 
 	self._voxelSize = 75
 	self._halfVoxelSizeVec = Vector3.one * (self._voxelSize / 2)
+	self._radiusThresholdForCorners = self._voxelSize * (1 / 8)
 	self._bestRefreshRate = 1 / 45
 	self._worstRefreshRate = 1 / 15
 	self._refreshRateRange = self._worstRefreshRate - self._bestRefreshRate
@@ -361,26 +364,33 @@ function CullThrottle._updateDesiredVoxelKeys(
 	objectData: ObjectData
 ): { [Vector3]: boolean }
 	local voxelSize = self._voxelSize
+	local radiusThresholdForCorners = self._radiusThresholdForCorners
 	local desiredVoxelKeys = {}
 
 	-- We'll get the voxelKeys for the center and the 8 corners of the object
 	local cframe, halfBoundingBox = objectData.cframe, objectData.halfBoundingBox
 	local position = cframe.Position
 
-	local vertices = {
-		-- Center of the object
-		position,
+	local vertices = nil
+	if objectData.radius < radiusThresholdForCorners then
+		-- Object is small enough that we can assume te center point is enough
+		vertices = { position }
+	else
+		vertices = {
+			-- Center of the object
+			position,
 
-		-- Corners of the bounding box (8 vertices)
-		(cframe * CFrame.new(halfBoundingBox.X, halfBoundingBox.Y, halfBoundingBox.Z)).Position,
-		(cframe * CFrame.new(-halfBoundingBox.X, -halfBoundingBox.Y, -halfBoundingBox.Z)).Position,
-		(cframe * CFrame.new(-halfBoundingBox.X, halfBoundingBox.Y, halfBoundingBox.Z)).Position,
-		(cframe * CFrame.new(-halfBoundingBox.X, -halfBoundingBox.Y, halfBoundingBox.Z)).Position,
-		(cframe * CFrame.new(-halfBoundingBox.X, halfBoundingBox.Y, -halfBoundingBox.Z)).Position,
-		(cframe * CFrame.new(halfBoundingBox.X, halfBoundingBox.Y, -halfBoundingBox.Z)).Position,
-		(cframe * CFrame.new(halfBoundingBox.X, -halfBoundingBox.Y, -halfBoundingBox.Z)).Position,
-		(cframe * CFrame.new(halfBoundingBox.X, -halfBoundingBox.Y, halfBoundingBox.Z)).Position,
-	}
+			-- Corners of the bounding box (8 vertices)
+			(cframe * CFrame.new(halfBoundingBox.X, halfBoundingBox.Y, halfBoundingBox.Z)).Position,
+			(cframe * CFrame.new(-halfBoundingBox.X, -halfBoundingBox.Y, -halfBoundingBox.Z)).Position,
+			(cframe * CFrame.new(-halfBoundingBox.X, halfBoundingBox.Y, halfBoundingBox.Z)).Position,
+			(cframe * CFrame.new(-halfBoundingBox.X, -halfBoundingBox.Y, halfBoundingBox.Z)).Position,
+			(cframe * CFrame.new(-halfBoundingBox.X, halfBoundingBox.Y, -halfBoundingBox.Z)).Position,
+			(cframe * CFrame.new(halfBoundingBox.X, halfBoundingBox.Y, -halfBoundingBox.Z)).Position,
+			(cframe * CFrame.new(halfBoundingBox.X, -halfBoundingBox.Y, -halfBoundingBox.Z)).Position,
+			(cframe * CFrame.new(halfBoundingBox.X, -halfBoundingBox.Y, halfBoundingBox.Z)).Position,
+		}
+	end
 
 	for _, vertex in vertices do
 		local voxelKey = vertex // voxelSize
@@ -631,7 +641,7 @@ function CullThrottle._processVoxel(
 		local screenSize = self:_getScreenSize(voxelDistance, objectData.radius)
 		local sizeRatio = (screenSize - MIN_SCREEN_SIZE) / SCREEN_SIZE_RANGE
 		local refreshDelay = bestRefreshRate + (refreshRateRange * (1 - sizeRatio))
-		local elapsed = now - objectData.lastUpdateClock
+		local elapsed = now - objectData.lastUpdateClock + objectData.jitterOffset
 		debug.profileend()
 
 		if elapsed <= refreshDelay then
@@ -660,9 +670,10 @@ function CullThrottle._getFrustumVoxelsInVolume(
 	callback: (Vector3, boolean) -> ()
 )
 	local isSingleVoxel = x1 - x0 == 1 and y1 - y0 == 1 and z1 - z0 == 1
+	local voxels = self._voxels
 
 	-- No need to check an empty voxel
-	if isSingleVoxel and not self._voxels[Vector3.new(x0, y0, z0)] then
+	if isSingleVoxel and not voxels[Vector3.new(x0, y0, z0)] then
 		return
 	end
 
@@ -673,7 +684,7 @@ function CullThrottle._getFrustumVoxelsInVolume(
 		for y = y0, y1 - 1 do
 			for z = z0, z1 - 1 do
 				local voxelKey = Vector3.new(x, y, z)
-				if self._voxels[voxelKey] then
+				if voxels[voxelKey] then
 					containsVoxels = true
 					if now - (self._lastVoxelVisibility[voxelKey] or 0) >= LAST_VISIBILITY_GRACE_PERIOD then
 						allVoxelsVisible = false
@@ -692,13 +703,19 @@ function CullThrottle._getFrustumVoxelsInVolume(
 
 	-- If all voxels in this box were visible a moment ago, just assume they still are
 	if allVoxelsVisible then
+		debug.profilebegin("allVoxelsVisible")
 		for x = x0, x1 - 1 do
 			for y = y0, y1 - 1 do
 				for z = z0, z1 - 1 do
-					callback(Vector3.new(x, y, z), false)
+					local voxelKey = Vector3.new(x, y, z)
+					if not voxels[voxelKey] then
+						continue
+					end
+					callback(voxelKey, false)
 				end
 			end
 		end
+		debug.profileend()
 		return
 	end
 
@@ -724,13 +741,19 @@ function CullThrottle._getFrustumVoxelsInVolume(
 	-- If the box is entirely inside, then we know all voxels contained inside are in the frustum
 	-- and we can process them now and not split further
 	if isCompletelyInside then
+		debug.profilebegin("isCompletelyInside")
 		for x = x0, x1 - 1 do
 			for y = y0, y1 - 1 do
 				for z = z0, z1 - 1 do
-					callback(Vector3.new(x, y, z), true)
+					local voxelKey = Vector3.new(x, y, z)
+					if not voxels[voxelKey] then
+						continue
+					end
+					callback(voxelKey, true)
 				end
 			end
 		end
+		debug.profileend()
 		return
 	end
 
@@ -901,6 +924,7 @@ end
 function CullThrottle.setVoxelSize(self: CullThrottle, voxelSize: number)
 	self._voxelSize = voxelSize
 	self._halfVoxelSizeVec = Vector3.one * (voxelSize / 2)
+	self._radiusThresholdForCorners = voxelSize * (1 / 8)
 
 	-- We need to move all the objects around to their new voxels
 	table.clear(self._voxels)
@@ -948,6 +972,7 @@ function CullThrottle.add(self: CullThrottle, object: Instance)
 		desiredVoxelKeys = {},
 		lastCheckClock = 0,
 		lastUpdateClock = 0,
+		jitterOffset = math.random(-1000, 1000) / 500000,
 		changeConnections = {},
 	}
 
