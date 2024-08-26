@@ -582,17 +582,13 @@ function CullThrottle._processVoxel(
 	shouldSizeThrottle: boolean,
 	updateLastVoxelVisiblity: boolean,
 	voxelKey: Vector3,
+	voxel: { Instance },
 	voxelSize: number,
 	halfVoxelSizeVec: Vector3,
 	cameraPos: Vector3,
 	bestRefreshRate: number,
 	refreshRateRange: number
 )
-	local voxel = self._voxels[voxelKey]
-	if not voxel then
-		return
-	end
-
 	if updateLastVoxelVisiblity then
 		self._lastVoxelVisibility[voxelKey] = now
 	end
@@ -667,13 +663,38 @@ function CullThrottle._getFrustumVoxelsInVolume(
 	x1: number,
 	y1: number,
 	z1: number,
-	callback: (Vector3, boolean) -> ()
+	callback: (Vector3, { Instance }, boolean) -> ()
 )
 	local isSingleVoxel = x1 - x0 == 1 and y1 - y0 == 1 and z1 - z0 == 1
 	local voxels = self._voxels
+	local lastVoxelVisibility = self._lastVoxelVisibility
 
-	-- No need to check an empty voxel
-	if isSingleVoxel and not voxels[Vector3.new(x0, y0, z0)] then
+	-- Special case for volumes of a single voxel
+	if isSingleVoxel then
+		local voxelKey = Vector3.new(x0, y0, z0)
+		local voxel = voxels[voxelKey]
+
+		-- No need to check an empty voxel
+		if not voxel then
+			return
+		end
+
+		-- If this voxel was visible a moment ago, assume it still is
+		if now - (lastVoxelVisibility[voxelKey] or 0) < LAST_VISIBILITY_GRACE_PERIOD then
+			callback(voxelKey, voxel, false)
+			return
+		end
+
+		-- Alright, we actually do need to check if this voxel is visible
+		local isInside = self:_isBoxInFrustum(false, frustumPlanes, x0, y0, z0, x1, y1, z1)
+		if not isInside then
+			-- Remove voxel visibility
+			lastVoxelVisibility[voxelKey] = nil
+			return
+		end
+
+		-- This voxel is visible
+		callback(voxelKey, voxel, true)
 		return
 	end
 
@@ -708,10 +729,11 @@ function CullThrottle._getFrustumVoxelsInVolume(
 			for y = y0, y1 - 1 do
 				for z = z0, z1 - 1 do
 					local voxelKey = Vector3.new(x, y, z)
-					if not voxels[voxelKey] then
+					local voxel = voxels[voxelKey]
+					if not voxel then
 						continue
 					end
-					callback(voxelKey, false)
+					callback(voxelKey, voxel, false)
 				end
 			end
 		end
@@ -720,21 +742,10 @@ function CullThrottle._getFrustumVoxelsInVolume(
 	end
 
 	-- Alright, we actually do need to check if this box is visible
-	local isInside, isCompletelyInside =
-		self:_isBoxInFrustum(isSingleVoxel == false, frustumPlanes, x0, y0, z0, x1, y1, z1)
+	local isInside, isCompletelyInside = self:_isBoxInFrustum(true, frustumPlanes, x0, y0, z0, x1, y1, z1)
 
 	-- If the box is outside the frustum, stop checking now
 	if not isInside then
-		if isSingleVoxel then
-			-- Remove voxel visibility
-			self._lastVoxelVisibility[Vector3.new(x0, y0, z0)] = nil
-		end
-		return
-	end
-
-	-- If the box is a single voxel, it cannot be split further
-	if isSingleVoxel then
-		callback(Vector3.new(x0, y0, z0), true)
 		return
 	end
 
@@ -746,10 +757,11 @@ function CullThrottle._getFrustumVoxelsInVolume(
 			for y = y0, y1 - 1 do
 				for z = z0, z1 - 1 do
 					local voxelKey = Vector3.new(x, y, z)
-					if not voxels[voxelKey] then
+					local voxel = voxels[voxelKey]
+					if not voxel then
 						continue
 					end
-					callback(voxelKey, true)
+					callback(voxelKey, voxel, true)
 				end
 			end
 		end
@@ -868,12 +880,13 @@ function CullThrottle._getObjects(self: CullThrottle, shouldSizeThrottle: boolea
 	local maxZ = maxBound.Z + 1
 
 	local thread = coroutine.create(function()
-		local function callback(voxelKey: Vector3, updateLastVoxelVisiblity: boolean)
+		local function callback(voxelKey: Vector3, voxel: { Instance }, updateLastVoxelVisiblity: boolean)
 			self:_processVoxel(
 				now,
 				shouldSizeThrottle,
 				updateLastVoxelVisiblity,
 				voxelKey,
+				voxel,
 				voxelSize,
 				halfVoxelSizeVec,
 				cameraPos,
