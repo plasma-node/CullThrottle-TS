@@ -13,11 +13,22 @@ local CameraCache = require(script.CameraCache)
 local EPSILON = 1e-4
 local LAST_VISIBILITY_GRACE_PERIOD = 0.15
 local MIN_SCREEN_SIZE = 1 / 100
-local MAX_SCREEN_SIZE = 8 / 100
+local MAX_SCREEN_SIZE = 10 / 100
 local SCREEN_SIZE_RANGE = MAX_SCREEN_SIZE - MIN_SCREEN_SIZE
 
 local CullThrottle = {}
 CullThrottle.__index = CullThrottle
+
+type ObjectData = {
+	lastCheckClock: number,
+	lastUpdateClock: number,
+	voxelKeys: { [Vector3]: true },
+	desiredVoxelKeys: { [Vector3]: boolean },
+	cframe: CFrame,
+	halfBoundingBox: Vector3,
+	radius: number,
+	changeConnections: { RBXScriptConnection },
+}
 
 type CullThrottleProto = {
 	_bestRefreshRate: number,
@@ -28,15 +39,7 @@ type CullThrottleProto = {
 	_halfVoxelSizeVec: Vector3,
 	_voxels: { [Vector3]: { Instance } },
 	_objects: {
-		[Instance]: {
-			lastUpdateClock: number,
-			voxelKey: Vector3,
-			desiredVoxelKey: Vector3?,
-			position: Vector3,
-			positionChangeConnection: RBXScriptConnection?,
-			radius: number,
-			radiusChangeConnection: RBXScriptConnection?,
-		},
+		[Instance]: ObjectData,
 	},
 	_objectRefreshQueue: PriorityQueue.PriorityQueue,
 	_vertexVisibilityCache: { [Vector3]: boolean },
@@ -63,96 +66,348 @@ function CullThrottle.new(): CullThrottle
 	return self
 end
 
-function CullThrottle._getPositionOfObject(
-	self: CullThrottle,
-	object: Instance,
-	onChanged: (() -> ())?
-): (Vector3?, RBXScriptConnection?)
+function CullThrottle._getObjectCFrame(self: CullThrottle, object: Instance): CFrame?
 	if object == workspace then
 		-- Workspace technically inherits Model,
 		-- but the origin vector isn't useful here
-		return nil, nil
+		return nil
 	end
 
-	local changeConnection = nil
-
 	if object:IsA("BasePart") then
-		if onChanged then
-			-- Connect to CFrame, not Position, since BulkMoveTo only fires CFrame changed event
-			changeConnection = object:GetPropertyChangedSignal("CFrame"):Connect(onChanged)
-		end
-		return object.Position, changeConnection
+		return object.CFrame
 	elseif object:IsA("Model") then
-		if onChanged then
-			changeConnection = object:GetPropertyChangedSignal("WorldPivot"):Connect(onChanged)
-		end
-		return object:GetPivot().Position, changeConnection
+		return object:GetPivot()
 	elseif object:IsA("Bone") then
-		if onChanged then
-			changeConnection = object:GetPropertyChangedSignal("TransformedWorldCFrame"):Connect(onChanged)
-		end
-		return object.TransformedWorldCFrame.Position, changeConnection
+		return object.TransformedWorldCFrame
 	elseif object:IsA("Attachment") then
-		if onChanged then
-			changeConnection = object:GetPropertyChangedSignal("WorldPosition"):Connect(onChanged)
-		end
-		return object.WorldPosition, changeConnection
+		return object.WorldCFrame
 	elseif object:IsA("Beam") then
 		-- Beams are roughly located between their attachments
 		local attachment0, attachment1 = object.Attachment0, object.Attachment1
 		if not attachment0 or not attachment1 then
 			warn("Cannot determine position of Beam since it does not have attachments")
-			return nil, nil
+			return nil
 		end
-		if onChanged then
-			-- We really should be listening to both attachments, but I don't care to support 2 change connections
-			-- for a single object right now.
-			changeConnection = attachment0:GetPropertyChangedSignal("WorldPosition"):Connect(onChanged)
-		end
-		return (attachment0.WorldPosition + attachment1.WorldPosition) / 2
-	elseif object:IsA("Light") or object:IsA("Sound") or object:IsA("ParticleEmitter") then
-		-- These effect objects are positioned based on their parent
-		if not object.Parent then
-			warn("Cannot determine position of " .. object.ClassName .. " since it is not parented")
-			return nil, nil
-		end
-		return self:_getPositionOfObject(object.Parent, onChanged)
+		return attachment0.WorldCFrame:Lerp(attachment1.WorldCFrame, 0.5)
 	end
 
 	-- We don't know how to get the position of this,
 	-- so let's assume it's at the parent position
 	if not object.Parent then
-		warn("Cannot determine position of " .. object.ClassName .. ", unknown class with no parent")
-		return nil, nil
+		warn("Cannot determine cframe of " .. object.ClassName .. ", unknown class with no parent")
+		return nil
 	end
 
-	local parentPosition, parentChangeConnection = self:_getPositionOfObject(object.Parent, onChanged)
-	if not parentPosition then
-		warn("Cannot determine position of " .. object:GetFullName() .. ", ancestry objects lack position info")
+	local parentCFrame = self:_getObjectCFrame(object.Parent)
+	if not parentCFrame then
+		warn("Cannot determine position of " .. object:GetFullName() .. ", ancestry objects lack cframe info")
 	end
 
-	return parentPosition, parentChangeConnection
+	return parentCFrame
 end
 
-function CullThrottle._getRadiusOfObject(
-	_self: CullThrottle,
+function CullThrottle._connectCFrameChangeEvent(
+	self: CullThrottle,
 	object: Instance,
-	onChanged: (() -> ())?
-): (number, RBXScriptConnection?)
-	local size = Vector3.one
-	local changeConnection = nil
+	callback: (CFrame) -> ()
+): { RBXScriptConnection }
+	local connections = {}
 
-	if object:IsA("BasePart") then
-		size = object.Size
-		if onChanged then
-			changeConnection = object:GetPropertyChangedSignal("Size"):Connect(onChanged)
-		end
-	elseif object:IsA("Model") then
-		size = object:GetExtentsSize()
+	if object == workspace then
+		-- Workspace technically inherits Model,
+		-- but the origin vector isn't useful here
+		return connections
 	end
 
-	-- Calculate the bounding sphere radius
-	return math.max(size.X, size.Y, size.Z) / 2, changeConnection
+	if object:IsA("BasePart") then
+		table.insert(
+			connections,
+			object:GetPropertyChangedSignal("CFrame"):Connect(function()
+				callback(object.CFrame)
+			end)
+		)
+	elseif object:IsA("Model") then
+		if object.PrimaryPart then
+			table.insert(
+				connections,
+				object.PrimaryPart:GetPropertyChangedSignal("CFrame"):Connect(function()
+					callback(object:GetPivot())
+				end)
+			)
+		else
+			table.insert(
+				connections,
+				object:GetPropertyChangedSignal("WorldPivot"):Connect(function()
+					callback(object:GetPivot())
+				end)
+			)
+		end
+	elseif object:IsA("Bone") then
+		table.insert(
+			connections,
+			object:GetPropertyChangedSignal("TransformedWorldCFrame"):Connect(function()
+				callback(object.TransformedWorldCFrame)
+			end)
+		)
+	elseif object:IsA("Attachment") then
+		table.insert(
+			connections,
+			object:GetPropertyChangedSignal("WorldCFrame"):Connect(function()
+				callback(object.WorldCFrame)
+			end)
+		)
+	elseif object:IsA("Beam") then
+		-- Beams are roughly located between their attachments
+		local attachment0, attachment1 = object.Attachment0, object.Attachment1
+		if not attachment0 or not attachment1 then
+			warn("Cannot determine position of Beam since it does not have attachments")
+			return connections
+		end
+		table.insert(
+			connections,
+			attachment0:GetPropertyChangedSignal("WorldCFrame"):Connect(function()
+				callback(self:_getObjectCFrame(object) or CFrame.identity)
+			end)
+		)
+		table.insert(
+			connections,
+			attachment1:GetPropertyChangedSignal("WorldCFrame"):Connect(function()
+				callback(self:_getObjectCFrame(object) or CFrame.identity)
+			end)
+		)
+	else
+		-- We don't know how to get the position of this,
+		-- so let's assume it's at the parent position
+		if not object.Parent then
+			warn("Cannot connect cframe of " .. object.ClassName .. ", unknown class with no parent")
+			return connections
+		end
+
+		local parentConnections = self:_connectCFrameChangeEvent(object.Parent, callback)
+		if not parentConnections then
+			warn("Cannot connect cframe of " .. object:GetFullName() .. ", ancestry objects lack cframe info")
+		end
+
+		return parentConnections
+	end
+
+	return connections
+end
+
+function CullThrottle._getObjectBoundingBox(self: CullThrottle, object: Instance): Vector3?
+	if object == workspace then
+		-- Workspace technically inherits Model,
+		-- but the origin vector isn't useful here
+		return nil
+	end
+
+	if object:IsA("BasePart") then
+		return object.Size
+	elseif object:IsA("Model") then
+		local _, size = object:GetBoundingBox()
+		return size
+	elseif object:IsA("Beam") then
+		-- Beams sized between their attachments with their defined width
+		local attachment0, attachment1 = object.Attachment0, object.Attachment1
+		if not attachment0 or not attachment1 then
+			warn("Cannot determine position of Beam since it does not have attachments")
+			return nil
+		end
+
+		local width = math.max(object.Width0, object.Width1)
+		local length = (attachment0.WorldPosition - attachment1.WorldPosition).Magnitude
+		return Vector3.new(width, width, length)
+	elseif object:IsA("PointLight") or object:IsA("SpotLight") then
+		return Vector3.one * object.Range
+	elseif object:IsA("Sound") then
+		return Vector3.one * object.RollOffMaxDistance
+	end
+
+	-- We don't know how to get the position of this,
+	-- so let's assume it's at the parent position
+	if not object.Parent then
+		warn("Cannot determine bounding box of " .. object.ClassName .. ", unknown class with no parent")
+		return nil
+	end
+
+	local parentBoundingBox = self:_getObjectBoundingBox(object.Parent)
+	if not parentBoundingBox then
+		warn("Cannot determine bounding box of " .. object:GetFullName() .. ", ancestry objects lack bounding box info")
+	end
+
+	return parentBoundingBox
+end
+
+function CullThrottle._connectBoundingBoxChangeEvent(
+	self: CullThrottle,
+	object: Instance,
+	callback: (Vector3) -> ()
+): { RBXScriptConnection }
+	local connections = {}
+
+	if object == workspace then
+		-- Workspace technically inherits Model,
+		-- but the origin vector isn't useful here
+		return connections
+	end
+
+	if object:IsA("BasePart") then
+		table.insert(
+			connections,
+			object:GetPropertyChangedSignal("Size"):Connect(function()
+				callback(object.Size)
+			end)
+		)
+	elseif object:IsA("Model") then
+		-- TODO: Figure out a decent way to tell when a model size
+		-- is changed without scale (ie: new parts added or resized)
+		table.insert(
+			connections,
+			object:GetPropertyChangedSignal("Scale"):Connect(function()
+				local _, size = object:GetBoundingBox()
+				callback(size)
+			end)
+		)
+	elseif object:IsA("Beam") then
+		-- Beams sized between their attachments with their defined width
+		local attachment0, attachment1 = object.Attachment0, object.Attachment1
+		if not attachment0 or not attachment1 then
+			warn("Cannot determine bounding box of Beam since it does not have attachments")
+			return connections
+		end
+
+		table.insert(
+			connections,
+			object:GetPropertyChangedSignal("Width0"):Connect(function()
+				callback(self:_getObjectBoundingBox(object) or Vector3.one)
+			end)
+		)
+		table.insert(
+			connections,
+			object:GetPropertyChangedSignal("Width1"):Connect(function()
+				callback(self:_getObjectBoundingBox(object) or Vector3.one)
+			end)
+		)
+		table.insert(
+			connections,
+			attachment0:GetPropertyChangedSignal("WorldPosition"):Connect(function()
+				callback(self:_getObjectBoundingBox(object) or Vector3.one)
+			end)
+		)
+		table.insert(
+			connections,
+			attachment1:GetPropertyChangedSignal("WorldPosition"):Connect(function()
+				callback(self:_getObjectBoundingBox(object) or Vector3.one)
+			end)
+		)
+	elseif object:IsA("PointLight") or object:IsA("SpotLight") then
+		table.insert(
+			connections,
+			object:GetPropertyChangedSignal("Range"):Connect(function()
+				callback(Vector3.one * object.Range)
+			end)
+		)
+	elseif object:IsA("Sound") then
+		table.insert(
+			connections,
+			object:GetPropertyChangedSignal("RollOffMaxDistance"):Connect(function()
+				callback(Vector3.one * object.RollOffMaxDistance)
+			end)
+		)
+	else
+		-- We don't know how to get the position of this,
+		-- so let's assume it's at the parent position
+		if not object.Parent then
+			warn("Cannot connect cframe of " .. object.ClassName .. ", unknown class with no parent")
+			return connections
+		end
+
+		local parentConnections = self:_connectBoundingBoxChangeEvent(object.Parent, callback)
+		if not parentConnections then
+			warn("Cannot connect cframe of " .. object:GetFullName() .. ", ancestry objects lack cframe info")
+		end
+
+		return parentConnections
+	end
+
+	return connections
+end
+
+function CullThrottle._subscribeToDimensionChanges(self: CullThrottle, object: Instance, objectData: ObjectData)
+	local cframeChangeConnections = self:_connectCFrameChangeEvent(object, function(cframe: CFrame)
+		-- Update CFrame
+		objectData.cframe = cframe
+		self:_updateDesiredVoxelKeys(object, objectData)
+	end)
+	local boundingBoxChangeConnections = self:_connectBoundingBoxChangeEvent(object, function(boundingBox: Vector3)
+		-- Update bounding box and radius
+		objectData.halfBoundingBox = boundingBox / 2
+		objectData.radius = math.max(boundingBox.X, boundingBox.Y, boundingBox.Z) / 2
+
+		self:_updateDesiredVoxelKeys(object, objectData)
+	end)
+
+	for _, connection in cframeChangeConnections do
+		table.insert(objectData.changeConnections, connection)
+	end
+	for _, connection in boundingBoxChangeConnections do
+		table.insert(objectData.changeConnections, connection)
+	end
+end
+
+function CullThrottle._updateDesiredVoxelKeys(
+	self: CullThrottle,
+	object: Instance,
+	objectData: ObjectData
+): { [Vector3]: boolean }
+	local voxelSize = self._voxelSize
+	local desiredVoxelKeys = {}
+
+	-- We'll get the voxelKeys for the center and the 8 corners of the object
+	local cframe, halfBoundingBox = objectData.cframe, objectData.halfBoundingBox
+	local position = cframe.Position
+
+	local vertices = {
+		-- Center of the object
+		position,
+
+		-- Corners of the bounding box (8 vertices)
+		(cframe * CFrame.new(halfBoundingBox.X, halfBoundingBox.Y, halfBoundingBox.Z)).Position,
+		(cframe * CFrame.new(-halfBoundingBox.X, -halfBoundingBox.Y, -halfBoundingBox.Z)).Position,
+		(cframe * CFrame.new(-halfBoundingBox.X, halfBoundingBox.Y, halfBoundingBox.Z)).Position,
+		(cframe * CFrame.new(-halfBoundingBox.X, -halfBoundingBox.Y, halfBoundingBox.Z)).Position,
+		(cframe * CFrame.new(-halfBoundingBox.X, halfBoundingBox.Y, -halfBoundingBox.Z)).Position,
+		(cframe * CFrame.new(halfBoundingBox.X, halfBoundingBox.Y, -halfBoundingBox.Z)).Position,
+		(cframe * CFrame.new(halfBoundingBox.X, -halfBoundingBox.Y, -halfBoundingBox.Z)).Position,
+		(cframe * CFrame.new(halfBoundingBox.X, -halfBoundingBox.Y, halfBoundingBox.Z)).Position,
+	}
+
+	for _, vertex in vertices do
+		local voxelKey = vertex // voxelSize
+		desiredVoxelKeys[voxelKey] = true
+	end
+
+	for voxelKey in objectData.voxelKeys do
+		if desiredVoxelKeys[voxelKey] then
+			-- Already in this desired voxel
+			desiredVoxelKeys[voxelKey] = nil
+		else
+			-- No longer want to be in this voxel
+			desiredVoxelKeys[voxelKey] = false
+		end
+	end
+
+	objectData.desiredVoxelKeys = desiredVoxelKeys
+
+	if next(desiredVoxelKeys) then
+		-- Use a cheap manhattan distance check for priority
+		local difference = position - CameraCache.Position
+		local priority = math.abs(difference.X) + math.abs(difference.Y) + math.abs(difference.Z)
+
+		self._objectRefreshQueue:enqueue(object, priority)
+	end
+
+	return desiredVoxelKeys
 end
 
 function CullThrottle._insertToVoxel(self: CullThrottle, voxelKey: Vector3, object: Instance)
@@ -201,14 +456,21 @@ function CullThrottle._processObjectRefreshQueue(self: CullThrottle, time_limit:
 	while (not self._objectRefreshQueue:empty()) and (os.clock() - now < time_limit) do
 		local object = self._objectRefreshQueue:dequeue()
 		local objectData = self._objects[object]
-		if (not objectData) or not objectData.desiredVoxelKey then
+		if (not objectData) or not next(objectData.desiredVoxelKeys) then
 			continue
 		end
 
-		self:_insertToVoxel(objectData.desiredVoxelKey, object)
-		self:_removeFromVoxel(objectData.voxelKey, object)
-		objectData.voxelKey = objectData.desiredVoxelKey
-		objectData.desiredVoxelKey = nil
+		for voxelKey, desired in objectData.desiredVoxelKeys do
+			if desired then
+				self:_insertToVoxel(voxelKey, object)
+				objectData.voxelKeys[voxelKey] = true
+				objectData.desiredVoxelKeys[voxelKey] = nil
+			else
+				self:_removeFromVoxel(voxelKey, object)
+				objectData.voxelKeys[voxelKey] = nil
+				objectData.desiredVoxelKeys[voxelKey] = nil
+			end
+		end
 	end
 	debug.profileend()
 end
@@ -326,11 +588,24 @@ function CullThrottle._processVoxel(
 	end
 
 	if not shouldSizeThrottle then
-		debug.profilebegin("usersCode")
 		for _, object in voxel do
+			local objectData = self._objects[object]
+			if not objectData then
+				continue
+			end
+
+			if objectData.lastCheckClock == now then
+				-- Avoid duplicate checks on this object
+				continue
+			end
+			objectData.lastCheckClock = now
+
+			debug.profilebegin("usersCode")
 			coroutine.yield(object)
+			debug.profileend()
+
+			objectData.lastUpdateClock = now
 		end
-		debug.profileend()
 		return
 	end
 
@@ -345,6 +620,12 @@ function CullThrottle._processVoxel(
 		if not objectData then
 			continue
 		end
+
+		if objectData.lastCheckClock == now then
+			-- Avoid duplicate checks on this object
+			continue
+		end
+		objectData.lastCheckClock = now
 
 		debug.profilebegin("sizeThrottle")
 		local screenSize = self:_getScreenSize(voxelDistance, objectData.radius)
@@ -625,14 +906,10 @@ function CullThrottle.setVoxelSize(self: CullThrottle, voxelSize: number)
 	table.clear(self._voxels)
 
 	for object, objectData in self._objects do
-		-- Seems like a fine time to refresh the positions too
-		objectData.position = self:_getPositionOfObject(object) or objectData.position
-
-		local voxelKey = objectData.position // voxelSize
-		objectData.voxelKey = voxelKey
-
-		self:_insertToVoxel(voxelKey, object)
+		self:_updateDesiredVoxelKeys(object, objectData)
 	end
+
+	self:_processObjectRefreshQueue(5)
 end
 
 function CullThrottle.setRenderDistance(self: CullThrottle, renderDistance: number)
@@ -653,69 +930,39 @@ function CullThrottle.setRefreshRates(self: CullThrottle, best: number, worst: n
 end
 
 function CullThrottle.add(self: CullThrottle, object: Instance)
-	local position, positionChangeConnection = self:_getPositionOfObject(object, function()
-		-- We aren't going to move voxels immediately, since having many parts jumping around voxels
-		-- is very costly. Instead, we queue up this object to be refreshed, and prioritize objects
-		-- that are moving around closer to the camera
-
-		local objectData = self._objects[object]
-		if not objectData then
-			return
-		end
-
-		local newPosition = self:_getPositionOfObject(object)
-		if not newPosition then
-			-- Don't know where this should go anymore. Might need to be removed,
-			-- but that's the user's responsibility
-			return
-		end
-
-		objectData.position = newPosition
-
-		local desiredVoxelKey = newPosition // self._voxelSize
-		if desiredVoxelKey == objectData.voxelKey then
-			-- Object moved within the same voxel, no need to refresh
-			return
-		end
-
-		objectData.desiredVoxelKey = desiredVoxelKey
-
-		-- Use a cheap manhattan distance check for priority
-		local difference = newPosition - CameraCache.Position
-		local priority = math.abs(difference.X) + math.abs(difference.Y) + math.abs(difference.Z)
-
-		self._objectRefreshQueue:enqueue(object, priority)
-	end)
-	if not position then
-		error("Cannot add " .. object:GetFullName() .. " to CullThrottle, position is unknown")
+	local cframe = self:_getObjectCFrame(object)
+	if not cframe then
+		error("Cannot add " .. object:GetFullName() .. " to CullThrottle, cframe is unknown")
 	end
 
-	local radius, radiusChangeConnection = self:_getRadiusOfObject(object, function()
-		local objectData = self._objects[object]
-		if not objectData then
-			return
-		end
+	local boundingBox = self:_getObjectBoundingBox(object)
+	if not boundingBox then
+		error("Cannot add " .. object:GetFullName() .. " to CullThrottle, bounding box is unknown")
+	end
 
-		local newRadius = self:_getRadiusOfObject(object)
-		if not newRadius then
-			return
-		end
-
-		objectData.radius = newRadius
-	end)
-
-	local objectData = {
-		lastUpdateClock = os.clock(),
-		voxelKey = position // self._voxelSize,
-		position = position,
-		positionChangeConnection = positionChangeConnection,
-		radius = radius,
-		radiusChangeConnection = radiusChangeConnection,
+	local objectData: ObjectData = {
+		cframe = cframe,
+		halfBoundingBox = boundingBox / 2,
+		radius = math.max(boundingBox.X, boundingBox.Y, boundingBox.Z) / 2,
+		voxelKeys = {},
+		desiredVoxelKeys = {},
+		lastCheckClock = 0,
+		lastUpdateClock = 0,
+		changeConnections = {},
 	}
+
+	self:_subscribeToDimensionChanges(object, objectData)
+	self:_updateDesiredVoxelKeys(object, objectData)
 
 	self._objects[object] = objectData
 
-	self:_insertToVoxel(objectData.voxelKey, object)
+	for voxelKey, desired in objectData.desiredVoxelKeys do
+		if desired then
+			self:_insertToVoxel(voxelKey, object)
+			objectData.voxelKeys[voxelKey] = true
+			objectData.desiredVoxelKeys[voxelKey] = nil
+		end
+	end
 end
 
 function CullThrottle.remove(self: CullThrottle, object: Instance)
@@ -723,11 +970,15 @@ function CullThrottle.remove(self: CullThrottle, object: Instance)
 	if not objectData then
 		return
 	end
-	if objectData.positionChangeConnection then
-		objectData.positionChangeConnection:Disconnect()
-	end
+
 	self._objects[object] = nil
-	self:_removeFromVoxel(objectData.voxelKey, object)
+
+	for _, connection in objectData.changeConnections do
+		connection:Disconnect()
+	end
+	for voxelKey in objectData.voxelKeys do
+		self:_removeFromVoxel(voxelKey, object)
+	end
 end
 
 function CullThrottle.getObjectsInView(self: CullThrottle): () -> (Instance?, number?)
