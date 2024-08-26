@@ -570,8 +570,8 @@ function CullThrottle._isBoxInFrustum(
 end
 
 function CullThrottle._getScreenSize(_self: CullThrottle, distance: number, radius: number): number
-	-- Calculate the screen size using the precomputed tan(FoV/2) * 2
-	local screenSize = (radius / distance) / CameraCache.DoubleTanFOV
+	-- Calculate the screen size using the precomputed tan(FoV/2)
+	local screenSize = (radius / distance) / CameraCache.HalfTanFOV
 
 	return math.clamp(screenSize, MIN_SCREEN_SIZE, MAX_SCREEN_SIZE)
 end
