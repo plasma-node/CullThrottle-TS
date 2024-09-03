@@ -38,6 +38,8 @@ type CullThrottleProto = {
 	_worstRefreshRate: number,
 	_refreshRateRange: number,
 	_renderDistance: number,
+	_targetPerformanceTime: number,
+	_performanceFalloffFactor: number,
 	_voxelSize: number,
 	_halfVoxelSizeVec: Vector3,
 	_radiusThresholdForCorners: number,
@@ -48,6 +50,8 @@ type CullThrottleProto = {
 	_objectRefreshQueue: PriorityQueue.PriorityQueue,
 	_vertexVisibilityCache: { [Vector3]: boolean },
 	_lastVoxelVisibility: { [Vector3]: number },
+	_lastCallTimes: { number },
+	_lastCallTimeIndex: number,
 }
 
 export type CullThrottle = typeof(setmetatable({} :: CullThrottleProto, CullThrottle))
@@ -60,17 +64,53 @@ function CullThrottle.new(): CullThrottle
 	self._voxelSize = 75
 	self._halfVoxelSizeVec = Vector3.one * (self._voxelSize / 2)
 	self._radiusThresholdForCorners = self._voxelSize * (1 / 8)
+	self._renderDistance = 450
+	self._targetPerformanceTime = 1.5 / 1000 -- 1.5ms default
 	self._bestRefreshRate = 1 / 45
 	self._worstRefreshRate = 1 / 15
 	self._refreshRateRange = self._worstRefreshRate - self._bestRefreshRate
-	self._renderDistance = 450
+	self._performanceFalloffFactor = 1
 	self._voxels = {}
 	self._objects = {}
 	self._objectRefreshQueue = PriorityQueue.new()
 	self._vertexVisibilityCache = {}
 	self._lastVoxelVisibility = {}
+	self._lastCallTimes = table.create(5, 0)
+	self._lastCallTimeIndex = 1
 
 	return self
+end
+
+function CullThrottle._getAverageCallTime(self: CullThrottle): number
+	local sum = 0
+	for _, callTime in self._lastCallTimes do
+		sum += callTime
+	end
+	return sum / #self._lastCallTimes
+end
+
+function CullThrottle._addCallTime(self: CullThrottle, start: number)
+	local callTime = os.clock() - start
+	self._lastCallTimes[self._lastCallTimeIndex] = callTime
+	self._lastCallTimeIndex = (self._lastCallTimeIndex % 5) + 1
+end
+
+function CullThrottle._updatePerformanceFalloffFactor(self: CullThrottle): number
+	local averageCallTime = self:_getAverageCallTime()
+	local targetCallTime = self._targetPerformanceTime
+	local adjustmentFactor = averageCallTime / targetCallTime
+
+	if adjustmentFactor > 1 then
+		-- We're overbudget, increase falloff (max 2)
+		self._performanceFalloffFactor =
+			math.min(self._performanceFalloffFactor * (1 + (adjustmentFactor - 1) * 0.5), 2)
+	else
+		-- We have extra budget, decrease falloff (min 0.5)
+		self._performanceFalloffFactor =
+			math.max(self._performanceFalloffFactor * (1 - (1 - adjustmentFactor) * 0.5), 0.5)
+	end
+
+	return self._performanceFalloffFactor
 end
 
 function CullThrottle._getObjectCFrame(self: CullThrottle, object: Instance): CFrame?
@@ -627,7 +667,7 @@ function CullThrottle._processVoxel(
 
 		debug.profilebegin("sizeThrottle")
 		local screenSize = self:_getScreenSize((objectData.cframe.Position - cameraPos).Magnitude, objectData.radius)
-		local sizeRatio = (screenSize - MIN_SCREEN_SIZE) / SCREEN_SIZE_RANGE
+		local sizeRatio = ((screenSize - MIN_SCREEN_SIZE) / SCREEN_SIZE_RANGE) ^ self._performanceFalloffFactor
 		local refreshDelay = bestRefreshRate + (refreshRateRange * (1 - sizeRatio))
 		local elapsed = now - objectData.lastUpdateClock + objectData.jitterOffset
 		debug.profileend()
@@ -854,9 +894,11 @@ function CullThrottle._getObjects(self: CullThrottle, shouldSizeThrottle: boolea
 	-- for up to 0.1 ms
 	self:_processObjectRefreshQueue(1e-4)
 
-	local voxelSize = self._voxelSize
-	local halfVoxelSizeVec = self._halfVoxelSizeVec
+	-- Update the performance falloff factor so
+	-- we can adjust our refresh rates to hit our target performance time
+	self:_updatePerformanceFalloffFactor()
 
+	local voxelSize = self._voxelSize
 	local bestRefreshRate = self._bestRefreshRate
 	local refreshRateRange = self._refreshRateRange
 	local renderDistance = self._renderDistance
@@ -915,12 +957,18 @@ function CullThrottle._getObjects(self: CullThrottle, shouldSizeThrottle: boolea
 
 	return function()
 		if coroutine.status(thread) == "dead" then
+			self:_addCallTime(now)
 			return
 		end
 
 		local success, object, elapsed = coroutine.resume(thread)
 		if not success then
 			warn("CullThrottle._getObjects thread error: " .. tostring(object))
+			return
+		end
+
+		if not object then
+			self:_addCallTime(now)
 			return
 		end
 

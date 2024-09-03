@@ -10,9 +10,11 @@ local PlayerGui = game:GetService("Players").LocalPlayer:WaitForChild("PlayerGui
 local ScreenGui = Instance.new("ScreenGui")
 
 local DebugInfo = Instance.new("TextLabel")
-DebugInfo.Size = UDim2.fromScale(1, 0.08)
+DebugInfo.Size = UDim2.fromScale(0.2, 0.1)
 DebugInfo.Position = UDim2.fromScale(0, 1)
 DebugInfo.AnchorPoint = Vector2.yAxis
+DebugInfo.TextXAlignment = Enum.TextXAlignment.Left
+DebugInfo.TextYAlignment = Enum.TextYAlignment.Top
 DebugInfo.TextScaled = true
 DebugInfo.TextColor3 = Color3.new(1, 1, 1)
 DebugInfo.FontFace = Font.fromEnum(Enum.Font.RobotoMono)
@@ -94,5 +96,14 @@ RunService.RenderStepped:Connect(function(frameDeltaTime)
 
 	workspace:BulkMoveTo(blocks, cframes, Enum.BulkMoveMode.FireCFrameChanged)
 
-	DebugInfo.Text = #blocks
+	local debugInfoBuffer = {}
+
+	table.insert(debugInfoBuffer, "blocks: " .. #blocks)
+	table.insert(debugInfoBuffer, string.format("time: %.3fms", FloatingBlocksUpdater:_getAverageCallTime() * 1000))
+	table.insert(
+		debugInfoBuffer,
+		string.format("falloff factor: %.2f", FloatingBlocksUpdater._performanceFalloffFactor)
+	)
+
+	DebugInfo.Text = table.concat(debugInfoBuffer, "\n")
 end)
