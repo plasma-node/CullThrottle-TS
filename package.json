@@ -1,6 +1,6 @@
 {
   "name": "@rbxts/cullthrottle-ts",
-  "version": "0.1.1-rc.0",
+  "version": "0.1.0-rc.1",
   "main": "src/init.lua",
   "types": "src/index.d.ts",
   "scripts": {
@@ -10,7 +10,7 @@
   },
   "keywords": [],
   "author": "",
-  "license": "ISC",
+  "license": "MPL-2.0",
   "description": "",
   "files": [
     "src",

@@ -1,0 +1,1 @@
+Fork of https://github.com/boatbomber/CullThrottle for roblox-ts support
