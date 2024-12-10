@@ -27,4 +27,4 @@ declare class CullThrottle {
 }
 
 
-export default CullThrottle;
+export = CullThrottle;
