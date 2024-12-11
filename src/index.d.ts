@@ -13,7 +13,7 @@ declare class CullThrottle {
     RemoveObjectsWithTag(tag: string): void
 
     GetVisibleObjects(): Instance[]
-    IterateObjectsToUpdate(): IterableFunction<[Instance, number, number]>
+    IterateObjectsToUpdate(): IterableFunction<LuaTuple<[Instance, number, number]>>
 
     SetVoxelSize(voxelSize: number): void
     SetRenderDistanceTarget(renderDistanceTarget: number): void
